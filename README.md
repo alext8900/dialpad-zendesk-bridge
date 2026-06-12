@@ -7,19 +7,21 @@ internal IT help desk. This bridge subscribes to Dialpad's raw **Call Events**
 
 ## What it does
 - Listens for Dialpad call events on `POST /dialpad/webhook`
-- **Only tickets calls an agent actually answered, plus voicemails.** A ticket is
-  created when an operator leg connects (`connected` with `target.type == "user"`)
-  or on a voicemail. Calls that die in the IVR menu or ring-and-hang-up never
-  produce an agent connect, so they don't ticket — that's the noise filter.
-- On **connected** (agent answered): creates the ticket. A call ringing through a
-  contact center fans out into many legs (each with its own `call_id`); they're
-  deduped on the call-graph root (`entry_point_call_id`), so it's **one ticket per
-  call**, assigned to the agent on the leg that actually answered.
-- On **hangup**: appends the call length to the subject (e.g. `… · 19 min`). Does
-  **not** create a ticket on its own (an unanswered hangup is filtered out).
+- **Only tickets calls an agent actually TALKED on, plus voicemails.** The ticket
+  is created at **hangup**, gated on `talk_time` (real agent conversation, which
+  excludes IVR menu / queue / ring time). Menu-disconnects, abandons, and transfer
+  hops have `talk_time == 0`, so they're filtered out. `MIN_TALK_SECONDS` (default
+  0) sets a minimum talk length.
+- **One ticket per call.** A call rings/transfers through many legs, each with its
+  own `call_id`, but all share `master_call_id` — the bridge dedupes on that, so
+  transfers and contact-center fan-out collapse to a single ticket.
+- **Assigned to whoever answered.** For a direct call the answering agent is the
+  `target`; for a contact-center call the target is the call center and the agent
+  is a separate operator leg, fetched via `operator_call_id` (Dialpad `GET
+  /api/v2/call/{id}`). No match → unassigned in the default (Support) group.
 - **Subject**: `Dialpad call with {caller} — answered by {agent} · {length}` for
-  answered calls, `Dialpad voicemail from {caller}` for voicemails. The first
-  comment is a clean Caller / Receiver breakdown (name, email, phone).
+  answered calls (length from `talk_time`), `Dialpad voicemail from {caller}` for
+  voicemails. The first comment is a clean Caller / Receiver breakdown.
 - On **voicemail / voicemail_uploaded**: creates a `voicemail` ticket and attaches
   the **voicemail recording as an actual audio file** (downloaded from Dialpad and
   re-uploaded to Zendesk, like the native integration) — this is the case the
@@ -31,10 +33,9 @@ internal IT help desk. This bridge subscribes to Dialpad's raw **Call Events**
   voicemail has no recap, so it gets the recording/transcript instead)
 - **Requester** = the caller, like the native integration: matches an existing
   Zendesk customer by phone, otherwise creates a new customer from the caller ID
-  (or the phone number). Never silently falls back to the API account.
-- **Answered calls are assigned to whoever picked up** — the agent's Dialpad email
-  (from the event `target`) is matched to a Zendesk agent. Voicemails/missed calls
-  are left unassigned so they fall into the default group for someone to grab.
+  (or the phone number). Never silently falls back to the API account. Created
+  customers carry **no `external_id`**, so they stay mergeable if Dialpad's caller
+  info was stale and a duplicate gets made.
 
 ## Prereqs
 - A Dialpad **admin/company API key** (the bridge uses it to register the webhook

@@ -59,12 +59,14 @@ DIALPAD_API_TOKEN = _cfg("DIALPAD_API_TOKEN")
 ATTACH_VOICEMAIL_AUDIO = _cfg("ATTACH_VOICEMAIL_AUDIO", "true").lower() == "true"
 # Set true to log the full Dialpad event payload (for diagnosing field names).
 DEBUG_PAYLOAD = _cfg("DEBUG_PAYLOAD", "false").lower() == "true"
-# States that should result in a ticket. 'connected' = answered (instant ticket).
-# 'hangup'/'voicemail' = safety net so missed calls still get a ticket. Drop
-# 'hangup' here if you DON'T want tickets for abandoned calls with no voicemail.
+# Minimum agent TALK time (seconds) for an answered call to make a ticket. We use
+# talk_time (real agent conversation, excluding IVR/queue/ring) so menu-disconnects
+# (talk_time 0) and pocket-dials are filtered. 0 = ticket any call with real talk.
+MIN_TALK_SECONDS = int(_cfg("MIN_TALK_SECONDS", "0") or 0)
+# States the bridge acts on for ticket CREATION. We create at hangup (talk_time is
+# only known then) for answered calls, and on voicemail_uploaded for voicemails.
 VOICEMAIL_STATES = {"voicemail", "voicemail_uploaded"}
-CREATE_STATES = {"connected", "hangup", "voicemail", "voicemail_uploaded"}
-TERMINAL_STATES = {"hangup", "voicemail", "voicemail_uploaded"}
+CREATE_STATES = {"hangup", "voicemail", "voicemail_uploaded"}
 # Only ticket INTERNAL (Dialpad-to-Dialpad) calls. External callers are already
 # ticketed by Dialpad's native Zendesk integration, so handling them here too
 # would double up. An internal caller has contact.type == "user"; external
@@ -117,14 +119,15 @@ async def dialpad_webhook(request: Request):
 
     contact = event.get("contact") or {}
     target = event.get("target") or {}
-    # One real call rings through a contact center as MANY legs, each with its own
-    # call_id. They all share the entry-point call's id, so key everything on that
-    # ("the call graph root") to keep it ONE ticket. Operator/agent legs carry
-    # entry_point_call_id; the entry-point leg has it null and IS the root.
-    key = str(event.get("entry_point_call_id") or call_id)
-    log.info("event call_id=%s key=%s state=%s direction=%s contact=%s:%s target=%s:%s",
+    # One real call rings/transfers through many legs, each with its own call_id,
+    # but they ALL share master_call_id (present even across transfers). Key on
+    # that so the whole call is ONE ticket. Fall back to entry_point_call_id, then
+    # this leg's own id for simple direct calls.
+    key = str(event.get("master_call_id") or event.get("entry_point_call_id") or call_id)
+    talk_secs = round((event.get("talk_time") or 0) / 1000)
+    log.info("event call_id=%s key=%s state=%s dir=%s contact=%s:%s target=%s:%s talk=%ss",
              call_id, key, state, direction, contact.get("type"), contact.get("name"),
-             target.get("type"), target.get("name"))
+             target.get("type"), target.get("name"), talk_secs)
     if DEBUG_PAYLOAD:
         log.info("payload call_id=%s %s", call_id, json.dumps(event, default=str))
 
@@ -147,32 +150,25 @@ async def dialpad_webhook(request: Request):
             return {"ignored": f"external caller (contact.type={contact_type or 'n/a'}); "
                                "handled by native integration"}
 
-        # We only ticket calls an AGENT actually answered (an operator leg
-        # connected -> target.type == "user") or that left a VOICEMAIL. Calls
-        # that died in the IVR menu or rang and hung up never produce an agent
-        # connect, so they don't ticket — that's the noise we're filtering.
-        answered = state == "connected" and (target.get("type") or "").lower() == "user"
+        # Ticket when an agent actually TALKED (talk_time, set at hangup, excludes
+        # IVR/queue/ring time) or a VOICEMAIL was left. Menu-disconnects, abandons,
+        # and transfer hops have talk_time 0 -> filtered out.
         voicemail = state in VOICEMAIL_STATES
+        answered = state == "hangup" and talk_secs > 0 and talk_secs >= MIN_TALK_SECONDS
 
-        if store.get_ticket(key) is None:
-            if not (answered or voicemail):
-                return {"ignored": "no agent answered (and not voicemail)"}
-            ticket_id, subject = _create_ticket(event, answered=answered,
-                                                voicemail=voicemail)
-            store.save_ticket(key, ticket_id, subject)
-            _attach_extras(key, event)
-            if state in TERMINAL_STATES:
-                store.mark_enriched(key)  # voicemail terminal: no length to add
-            if answered:
-                _maybe_assign(key, event)
-            return {"created": ticket_id, "answered": answered, "voicemail": voicemail}
+        if store.get_ticket(key) is not None:
+            return {"ok": "deduped"}  # another leg of a call we already ticketed
+        if not (answered or voicemail):
+            return {"ignored": f"not ticketed (talk={talk_secs}s, state={state})"}
 
-        # Ticket already exists for this call. Later legs still tell us things:
-        # the operator leg that connected = who answered; hangup = call length.
-        if state == "connected":
-            _maybe_assign(key, event)
-        if state == "hangup":
-            _maybe_enrich(key, event)
+        agent = _resolve_agent(event) if answered else None
+        ticket_id, subject = _create_ticket(event, answered=answered, voicemail=voicemail,
+                                            agent=agent, talk_secs=talk_secs)
+        store.save_ticket(key, ticket_id, subject)
+        _attach_extras(key, event)
+        if agent:
+            _assign(key, ticket_id, agent)
+        return {"created": ticket_id, "answered": answered, "voicemail": voicemail}
 
     return {"ok": state}
 
@@ -212,12 +208,13 @@ def _find_user_by_phone(phone: str):
 
 def _create_end_user(name: str, phone: str = None, email: str = None):
     """Create (or update) a Zendesk end-user 'customer' for the caller, mirroring
-    the native integration when no match exists. Keyed on external_id=phone so a
-    repeat caller from the same number reuses the same customer (no duplicates)."""
+    the native integration when no match exists. Deliberately does NOT set an
+    external_id: an external_id makes the contact impossible to merge later, which
+    is a problem when Dialpad has stale info (e.g. someone's email changed) and a
+    duplicate gets made. Repeat callers are deduped by the phone search instead."""
     user = {"name": name, "role": "end-user", "verified": True}
     if phone:
         user["phone"] = phone
-        user["external_id"] = f"dialpad:{_norm_phone(phone)}"
     if email:
         user["email"] = email
     try:
@@ -247,15 +244,40 @@ def _requester_id(event: dict):
     return _create_end_user(name or phone, phone, email)
 
 
-def _assignee_id(event: dict):
-    """For an ANSWERED call, the target is the agent who picked up (target.type
-    == 'user'). Match them to a Zendesk agent by email so the ticket is assigned
-    to whoever took the call. Returns None for non-user targets / no match, in
-    which case the ticket just lands in the default group for someone to grab."""
-    target = event.get("target") or {}
-    if (target.get("type") or "").lower() != "user":
+def _fetch_call(call_id):
+    """GET a single Dialpad call's details (used to resolve the operator leg)."""
+    if not DIALPAD_API_TOKEN:
         return None
-    email = target.get("email")
+    try:
+        r = httpx.get(f"https://dialpad.com/api/v2/call/{call_id}",
+                      headers={"Authorization": f"Bearer {DIALPAD_API_TOKEN}"},
+                      timeout=15)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        log.warning("fetch call %s failed: %s", call_id, e)
+        return None
+
+
+def _resolve_agent(event: dict):
+    """Find the agent who answered. For a direct call the target IS the agent
+    (target.type == user). For a contact-center call the target is the call center
+    and the agent is a separate operator leg (operator_call_id) we must fetch.
+    Returns {'name','email'} or None."""
+    t = event.get("target") or {}
+    if (t.get("type") or "").lower() == "user" and t.get("email"):
+        return {"name": t.get("name"), "email": t.get("email")}
+    op = event.get("operator_call_id")
+    if op:
+        leg = _fetch_call(op)
+        lt = (leg or {}).get("target") or {}
+        if (lt.get("type") or "").lower() == "user" and lt.get("email"):
+            return {"name": lt.get("name"), "email": lt.get("email")}
+    return None
+
+
+def _zendesk_agent_id(email: str):
+    """Match an email to a Zendesk agent/admin user id."""
     if not email:
         return None
     try:
@@ -266,7 +288,7 @@ def _assignee_id(event: dict):
             if u.get("role") in ("agent", "admin"):
                 return u["id"]
     except Exception as e:
-        log.warning("assignee lookup failed for %s: %s", email, e)
+        log.warning("agent lookup failed for %s: %s", email, e)
     return None
 
 
@@ -277,21 +299,16 @@ def _update_ticket(ticket_id: int, fields: dict):
     r.raise_for_status()
 
 
-def _maybe_assign(key: str, event: dict):
-    """Assign the call's ONE ticket to the agent who answered (the operator leg
-    whose target is a user). Idempotent — assigns once per call, even though the
-    same logical call rings through several agent legs."""
-    if store.is_assigned(key):
-        return
-    ticket_id = store.get_ticket(key)
-    if not ticket_id:
-        return
-    aid = _assignee_id(event)
+def _assign(key: str, ticket_id: int, agent: dict):
+    """Assign the ticket to the resolved answering agent (matched in Zendesk by
+    email). No match -> leave unassigned in the default (Support) group."""
+    aid = _zendesk_agent_id(agent.get("email"))
     if not aid:
-        return  # not the agent leg (e.g. the entry-point/queue leg) — wait for it
+        return
     _update_ticket(ticket_id, {"assignee_id": aid})
     store.mark_assigned(key)
-    log.info("assigned ticket %s to agent %s (call %s)", ticket_id, aid, key)
+    log.info("assigned ticket %s to agent %s <%s> (call %s)",
+             ticket_id, aid, agent.get("email"), key)
 
 
 def _comment(ticket_id: int, body: str, uploads=None):
@@ -348,34 +365,42 @@ def _caller_name(event: dict) -> str:
     return c.get("name") or c.get("phone") or "Unknown caller"
 
 
-def _receiver_name(event: dict) -> str:
-    """Agent who took it, prefixed with the queue if we know it (e.g.
-    'IT - Technical Support / Alex Thompson')."""
-    agent = (event.get("target") or {}).get("name") or "IT"
-    queue = (event.get("entry_point_target") or {}).get("name")
-    return f"{queue} / {agent}" if queue and queue != agent else agent
+def _receiver_name(event: dict, agent: dict = None) -> str:
+    """Who took it: the resolved agent if we have one, else the queue/target name,
+    prefixed with the queue when both are known ('IT - AS400 / Alex Thompson')."""
+    queue = (event.get("target") or {}).get("name")
+    agent_name = (agent or {}).get("name")
+    if agent_name and queue and queue != agent_name:
+        return f"{queue} / {agent_name}"
+    return agent_name or queue or "IT"
 
 
-def _subject(event: dict, answered: bool, voicemail: bool) -> str:
+def _subject(event: dict, answered: bool, voicemail: bool,
+             agent: dict = None, talk_secs: int = 0) -> str:
     caller = _caller_name(event)
     if voicemail:
         return f"Dialpad voicemail from {caller}"
-    return f"Dialpad call with {caller} — answered by {_receiver_name(event)}"
+    base = f"Dialpad call with {caller} — answered by {_receiver_name(event, agent)}"
+    return f"{base} · {_fmt_duration(talk_secs * 1000)}" if talk_secs else base
 
 
-def _render_body(event: dict, answered: bool, voicemail: bool) -> str:
+def _render_body(event: dict, answered: bool, voicemail: bool,
+                 agent: dict = None, talk_secs: int = 0) -> str:
     contact = event.get("contact") or {}
     target = event.get("target") or {}
-    header = _subject(event, answered, voicemail)
-    lines = [header, "", f"Direction: {(event.get('direction') or 'n/a').title()}",
-             "", "— Caller —", f"Name: {contact.get('name') or '—'}"]
+    lines = [_subject(event, answered, voicemail, agent, talk_secs), "",
+             f"Direction: {(event.get('direction') or 'n/a').title()}"]
+    if answered and talk_secs:
+        lines.append(f"Talk time: {_fmt_duration(talk_secs * 1000)}")
+    lines += ["", "— Caller —", f"Name: {contact.get('name') or '—'}"]
     if contact.get("email"):
         lines.append(f"Email: {contact['email']}")
     if contact.get("phone"):
         lines.append(f"Phone: {contact['phone']}")
-    lines += ["", "— Receiver —", f"Name: {_receiver_name(event)}"]
-    if target.get("email"):
-        lines.append(f"Email: {target['email']}")
+    lines += ["", "— Receiver —", f"Name: {_receiver_name(event, agent)}"]
+    recv_email = (agent or {}).get("email") or target.get("email")
+    if recv_email:
+        lines.append(f"Email: {recv_email}")
     if target.get("phone"):
         lines.append(f"Phone: {target['phone']}")
     if voicemail:
@@ -384,24 +409,24 @@ def _render_body(event: dict, answered: bool, voicemail: bool) -> str:
     return "\n".join(lines)
 
 
-def _create_ticket(event: dict, answered: bool, voicemail: bool = False):
-    """Returns (ticket_id, subject). Subject gets the call length appended later
-    on hangup (see _maybe_enrich)."""
-    subject = _subject(event, answered, voicemail)
+def _create_ticket(event: dict, answered: bool, voicemail: bool = False,
+                   agent: dict = None, talk_secs: int = 0):
+    """Returns (ticket_id, subject). Created at hangup, so the call length
+    (talk_secs) is known and baked into the subject right away."""
+    subject = _subject(event, answered, voicemail, agent, talk_secs)
     tags = ["dialpad", "internal-call"]
     if voicemail:
         tags += ["voicemail", "missed-call"]
 
     ticket = {
         "subject": subject,
-        "comment": {"body": _render_body(event, answered, voicemail), "public": False},
+        "comment": {"body": _render_body(event, answered, voicemail, agent, talk_secs),
+                    "public": False},
         "tags": tags,
     }
     rid = _requester_id(event)
     if rid:
         ticket["requester_id"] = rid
-    # Assignment happens separately via _maybe_assign once we see the operator
-    # leg that actually answered. Voicemails stay unassigned -> default group.
     if DEFAULT_GROUP_ID.isdigit():
         ticket["group_id"] = int(DEFAULT_GROUP_ID)
 
@@ -409,24 +434,9 @@ def _create_ticket(event: dict, answered: bool, voicemail: bool = False):
                    auth=ZAUTH, timeout=15)
     r.raise_for_status()
     tid = r.json()["ticket"]["id"]
-    log.info("created ticket %s (answered=%s voicemail=%s) for call %s",
-             tid, answered, voicemail, event.get("call_id"))
+    log.info("created ticket %s (answered=%s voicemail=%s talk=%ss) for call %s",
+             tid, answered, voicemail, talk_secs, event.get("call_id"))
     return tid, subject
-
-
-def _maybe_enrich(call_id: str, event: dict):
-    """When the call ends, append the call length to the subject (it wasn't known
-    at answer time): 'Dialpad call with X — answered by Y · 19 min'."""
-    ticket_id = store.get_ticket(call_id)
-    if not ticket_id or store.is_enriched(call_id):
-        return
-    base = store.get_subject(call_id)
-    dur = event.get("duration")
-    if base and dur:
-        _update_ticket(ticket_id, {"subject": f"{base} · {_fmt_duration(dur)}"})
-        log.info("set length on ticket %s (call %s): %s", ticket_id, call_id,
-                 _fmt_duration(dur))
-    store.mark_enriched(call_id)
 
 
 def _maybe_attach_voicemail(call_id: str, event: dict):

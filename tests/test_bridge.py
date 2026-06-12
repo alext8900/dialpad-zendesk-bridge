@@ -1,14 +1,14 @@
-"""Regression tests for the Dialpad -> Zendesk bridge state machine.
+"""Regression tests for the Dialpad -> Zendesk bridge.
 
-These exercise the observable behavior of POST /dialpad/webhook end to end:
-ticket-on-answer, dedup, the missed-call safety net, hangup enrichment, and
-recording attachment. All Zendesk/Dialpad HTTP traffic is mocked, so the suite
-runs with no network and no real credentials.
+Exercises POST /dialpad/webhook end to end: tickets are created at hangup for
+calls an agent actually TALKED on (talk_time), or on voicemail; all legs of one
+call dedupe on master_call_id; the answering agent is assigned (resolving the
+operator leg when needed); requester is matched/created from the caller. All
+Zendesk/Dialpad HTTP is mocked — no network, no creds.
 
 Run:  python -m pytest -q   (after pip install -r requirements-dev.txt)
 """
 
-import importlib
 import os
 import re
 
@@ -18,7 +18,6 @@ import pytest
 os.environ.setdefault("ZENDESK_SUBDOMAIN", "demo")
 os.environ.setdefault("ZENDESK_EMAIL", "it@demo.com")
 os.environ.setdefault("ZENDESK_API_TOKEN", "tok")
-# No DIALPAD_WEBHOOK_SECRET -> the webhook accepts plain JSON (no JWT needed).
 os.environ.pop("DIALPAD_WEBHOOK_SECRET", None)
 
 from fastapi.testclient import TestClient
@@ -41,25 +40,17 @@ class FakeResp:
 
 class FakeHttpx:
     """Records calls and returns canned responses. `posts` holds ONLY ticket
-    creates; user-creates and uploads are tracked separately so ticket-count
-    assertions stay clean.
-
-    - GET  .../users/search.json   -> agent (by email) / customer (by phone) / none
-    - GET  dialpad secureblob link -> fake audio bytes
-    - POST .../tickets.json        -> a new ticket with an incrementing id
-    - POST .../users/create_or_update.json -> a new customer
-    - POST .../uploads.json        -> a fake upload token
-    - PUT  .../tickets/{id}.json   -> the enrich / recap / voicemail updates
-    """
+    creates; user-creates and uploads are tracked separately."""
 
     def __init__(self):
-        self.posts = []          # ticket creates only
+        self.posts = []           # ticket creates only
         self.puts = []
         self.gets = []
         self.uploads = []
-        self.created_users = []   # [{"id":..., "payload":...}]
-        self.agents = {}          # email -> zendesk agent id (assignee lookup)
-        self.users_by_phone = {}  # normalized phone -> {"id":..., "phone":...}
+        self.created_users = []    # [{"id":..., "payload":...}]
+        self.agents = {}           # email -> zendesk agent id
+        self.users_by_phone = {}   # normalized phone -> {"id":..., "phone":...}
+        self.operator_legs = {}    # dialpad call_id -> call json (for operator fetch)
         self._next_id = 100
 
     def get(self, url, **kwargs):
@@ -72,8 +63,10 @@ class FakeHttpx:
             if norm and norm in self.users_by_phone:
                 return FakeResp({"users": [self.users_by_phone[norm]]})
             return FakeResp({"users": []})
-        # voicemail audio download
-        return FakeResp(content=b"FAKE-AUDIO-BYTES",
+        if "/api/v2/call/" in url:                       # operator-leg fetch
+            cid = url.rsplit("/", 1)[-1]
+            return FakeResp(self.operator_legs.get(cid, {}))
+        return FakeResp(content=b"FAKE-AUDIO-BYTES",      # voicemail audio download
                         headers={"content-type": "audio/mpeg"})
 
     def post(self, url, **kwargs):
@@ -85,8 +78,7 @@ class FakeHttpx:
             self.created_users.append({"id": self._next_id,
                                        "payload": kwargs["json"]["user"]})
             return FakeResp({"user": {"id": self._next_id}})
-        # tickets.json
-        self.posts.append((url, kwargs))
+        self.posts.append((url, kwargs))                 # tickets.json
         self._next_id += 1
         return FakeResp({"ticket": {"id": self._next_id}})
 
@@ -97,16 +89,13 @@ class FakeHttpx:
 
 @pytest.fixture
 def client(tmp_path, monkeypatch):
-    # Fresh SQLite state per test so dedup memory never leaks across tests.
     db = tmp_path / "state.db"
     monkeypatch.setattr(store, "DB_PATH", str(db))
     store.init()
-
     fake = FakeHttpx()
     monkeypatch.setattr(main, "httpx", fake)
-
     c = TestClient(main.app)
-    c.fake = fake  # stash for assertions
+    c.fake = fake
     return c
 
 
@@ -116,11 +105,15 @@ def _event(state, call_id="call-1", direction="inbound", **extra):
         "state": state,
         "direction": direction,
         "contact": {"name": "Jane Tech", "phone": "+15551112222", "type": "user"},
-        # default target is an agent (type=user) so a 'connected' counts as answered
         "target": {"type": "user", "name": "IT Agent"},
     }
     ev.update(extra)
     return ev
+
+
+def _answered(call_id="call-1", talk_time=120000, **extra):
+    """A hangup event for a call an agent talked on (talk_time ms)."""
+    return _event("hangup", call_id=call_id, talk_time=talk_time, **extra)
 
 
 def post(client, event):
@@ -128,7 +121,6 @@ def post(client, event):
 
 
 def _assignee_in_puts(fake):
-    """The assignee is applied via a ticket PUT (separate from creation)."""
     for _url, kw in fake.puts:
         aid = kw["json"]["ticket"].get("assignee_id")
         if aid is not None:
@@ -136,120 +128,144 @@ def _assignee_in_puts(fake):
     return None
 
 
-def test_answered_call_creates_one_ticket_on_connected(client):
-    r = post(client, _event("connected"))
+def _subject_of(fake, i=0):
+    return fake.posts[i][1]["json"]["ticket"]["subject"]
+
+
+# ---- creation gating -------------------------------------------------------
+
+def test_answered_call_creates_one_ticket(client):
+    r = post(client, _answered())
     assert r.json()["answered"] is True
-    assert len(client.fake.posts) == 1  # exactly one ticket created
-    # Answered tickets are NOT tagged missed-call.
-    ticket = client.fake.posts[0][1]["json"]["ticket"]
-    assert "missed-call" not in ticket["tags"]
+    assert len(client.fake.posts) == 1
+    assert "missed-call" not in client.fake.posts[0][1]["json"]["ticket"]["tags"]
 
 
-def test_answered_call_assigned_to_agent_who_picked_up(client):
-    # On answer, target is the agent (target.type=user); assign by email match.
+def test_connected_event_does_not_create_ticket(client):
+    # We create at hangup (talk_time known then), not on connect.
+    r = post(client, _event("connected"))
+    assert "created" not in r.json()
+    assert len(client.fake.posts) == 0
+
+
+def test_unanswered_hangup_creates_no_ticket(client):
+    # Rang/menu-disconnect: talk_time 0 -> no agent talked -> no ticket.
+    r = post(client, _event("hangup", talk_time=0, duration=8000))
+    assert "ignored" in r.json()
+    assert len(client.fake.posts) == 0
+
+
+def test_min_talk_threshold_filters_short_calls(client, monkeypatch):
+    monkeypatch.setattr(main, "MIN_TALK_SECONDS", 10)
+    post(client, _answered(talk_time=5000))             # 5s < 10 -> filtered
+    assert len(client.fake.posts) == 0
+    post(client, _answered(call_id="c2", talk_time=15000))   # 15s -> ticket
+    assert len(client.fake.posts) == 1
+
+
+def test_outbound_call_not_ticketed(client):
+    r = post(client, _answered(direction="outbound"))
+    assert "ignored" in r.json()
+    assert len(client.fake.posts) == 0
+
+
+def test_external_caller_is_skipped(client):
+    ev = _answered()
+    ev["contact"] = {"name": "Acme Corp", "phone": "+18005550000", "type": "google"}
+    r = post(client, ev)
+    assert "ignored" in r.json() and "external" in r.json()["ignored"]
+    assert len(client.fake.posts) == 0
+
+
+def test_event_without_call_id_is_ignored(client):
+    r = client.post("/dialpad/webhook", json={"state": "hangup"})
+    assert r.json() == {"ignored": "no call_id/state"}
+    assert len(client.fake.posts) == 0
+
+
+# ---- dedup across legs / transfers ----------------------------------------
+
+def test_call_legs_dedup_on_master_call_id(client):
+    post(client, _answered(call_id="LEG1", master_call_id="M"))
+    post(client, _answered(call_id="LEG2", master_call_id="M"))
+    assert len(client.fake.posts) == 1
+
+
+def test_transfer_hop_does_not_make_extra_ticket(client):
+    hop = _event("hangup", call_id="HOP", talk_time=0, master_call_id="M")
+    hop["target"] = {"type": "call_center", "name": "IT - AS400"}
+    post(client, hop)                                   # talk 0 -> nothing
+    assert len(client.fake.posts) == 0
+    post(client, _answered(call_id="ANS", master_call_id="M"))  # answered -> 1
+    assert len(client.fake.posts) == 1
+
+
+# ---- assignment ------------------------------------------------------------
+
+def test_answered_call_assigned_to_agent(client):
+    # Direct call: target IS the agent (type user + email).
     client.fake.agents = {"agent@demo.com": 555}
-    ev = _event("connected")
+    ev = _answered()
     ev["target"] = {"type": "user", "name": "Agent Smith", "email": "agent@demo.com"}
     post(client, ev)
     assert _assignee_in_puts(client.fake) == 555
 
 
-def test_contact_center_call_makes_one_ticket_assigned_to_answerer(client):
-    # A call ringing through a contact center = an entry-point leg (the queue) +
-    # an operator leg (the agent), each with its own call_id but a shared
-    # entry_point_call_id. It must produce ONE ticket, assigned to the answerer.
+def test_contact_center_assigns_via_operator_fetch(client, monkeypatch):
+    # CC call: target is the call center; the agent is a separate operator leg we
+    # fetch via operator_call_id. One ticket, assigned to the fetched agent.
+    monkeypatch.setattr(main, "DIALPAD_API_TOKEN", "dp")
     client.fake.agents = {"alex@bpiteam.com": 99}
-    entry = _event("connected", call_id="ROOT")
-    entry["target"] = {"type": "callcenter", "name": "IT - All Agents"}
-    op = _event("connected", call_id="OP1", entry_point_call_id="ROOT")
-    op["target"] = {"type": "user", "name": "Alex", "email": "alex@bpiteam.com"}
-    post(client, entry)   # queue leg first -> ticket created, unassigned
-    post(client, op)      # agent leg -> same ticket, now assigned
+    client.fake.operator_legs["OP1"] = {
+        "target": {"type": "user", "name": "Alex Thompson", "email": "alex@bpiteam.com"}}
+    ev = _answered(call_id="LEG", talk_time=88000, master_call_id="M",
+                   operator_call_id="OP1")
+    ev["target"] = {"type": "call_center", "name": "IT - AS400 (Don't Call)"}
+    post(client, ev)
     assert len(client.fake.posts) == 1
     assert _assignee_in_puts(client.fake) == 99
+    assert "Alex Thompson" in _subject_of(client.fake)   # queue / agent in subject
 
 
-def test_contact_center_operator_leg_first_still_one_ticket(client):
-    # Same as above but the agent leg arrives first (event ordering isn't fixed).
-    client.fake.agents = {"alex@bpiteam.com": 99}
-    op = _event("connected", call_id="OP1", entry_point_call_id="ROOT")
-    op["target"] = {"type": "user", "name": "Alex", "email": "alex@bpiteam.com"}
-    entry = _event("connected", call_id="ROOT")
-    entry["target"] = {"type": "callcenter", "name": "IT - All Agents"}
-    post(client, op)
-    post(client, entry)
+def test_unresolvable_agent_leaves_ticket_unassigned(client):
+    # CC call but no token/operator info -> ticket created, just unassigned.
+    ev = _answered(master_call_id="M")
+    ev["target"] = {"type": "call_center", "name": "IT - AS400"}
+    post(client, ev)
     assert len(client.fake.posts) == 1
-    assert _assignee_in_puts(client.fake) == 99
+    assert _assignee_in_puts(client.fake) is None
 
 
-def test_voicemail_left_unassigned_for_the_group(client):
-    # Voicemails get no assignee -> default (Support) group.
+# ---- subject / length ------------------------------------------------------
+
+def test_subject_includes_caller_agent_and_length(client):
+    ev = _answered(talk_time=1140000)                   # 19 min
+    ev["contact"] = {"name": "Walet Jan", "phone": "+12256036216", "type": "user"}
+    ev["target"] = {"type": "user", "name": "Alex Thompson", "email": "a@bpiteam.com"}
+    post(client, ev)
+    assert _subject_of(client.fake) == \
+        "Dialpad call with Walet Jan — answered by Alex Thompson · 19 min"
+
+
+def test_short_answered_length_in_seconds(client):
+    post(client, _answered(talk_time=42000))
+    assert _subject_of(client.fake).endswith("· 42 sec")
+
+
+def test_voicemail_subject_and_unassigned(client):
     r = post(client, _event("voicemail_uploaded", voicemail_link="https://x/vm"))
     assert r.json()["voicemail"] is True
-    ticket = client.fake.posts[0][1]["json"]["ticket"]
-    assert "assignee_id" not in ticket
+    t = client.fake.posts[0][1]["json"]["ticket"]
+    assert t["subject"] == "Dialpad voicemail from Jane Tech"
+    assert "assignee_id" not in t
 
 
-def test_duplicate_connected_does_not_create_second_ticket(client):
-    post(client, _event("connected"))
-    post(client, _event("connected"))  # e.g. a transfer / hold re-connect
-    assert len(client.fake.posts) == 1  # still just one ticket
-
-
-def test_hangup_appends_call_length_to_subject(client):
-    post(client, _event("connected"))
-    post(client, _event("hangup", duration=42000))
-    assert len(client.fake.posts) == 1          # no new ticket
-    subj_puts = [p for p in client.fake.puts if "subject" in p[1]["json"]["ticket"]]
-    assert subj_puts and "42 sec" in subj_puts[-1][1]["json"]["ticket"]["subject"]
-
-
-def test_subject_format_answered_and_voicemail(client):
-    a = _event("connected")
-    a["contact"] = {"name": "Walet Jan", "phone": "+12256036216", "type": "user"}
-    a["target"] = {"type": "user", "name": "Alex Thompson", "email": "a@bpiteam.com"}
-    post(client, a)
-    assert client.fake.posts[0][1]["json"]["ticket"]["subject"] == \
-        "Dialpad call with Walet Jan — answered by Alex Thompson"
-
-    v = _event("voicemail_uploaded", call_id="vm-1", voicemail_link="https://x/vm")
-    v["contact"] = {"name": "Walet Jan", "phone": "+12256036216", "type": "user"}
-    post(client, v)
-    assert client.fake.posts[1][1]["json"]["ticket"]["subject"] == \
-        "Dialpad voicemail from Walet Jan"
-
-
-def test_long_call_length_formats_minutes(client):
-    post(client, _event("connected"))
-    post(client, _event("hangup", duration=1140000))   # 19 min
-    subj_puts = [p for p in client.fake.puts if "subject" in p[1]["json"]["ticket"]]
-    assert subj_puts and subj_puts[-1][1]["json"]["ticket"]["subject"].endswith("· 19 min")
-
-
-def test_unanswered_hangup_creates_no_ticket(client):
-    # Rang and hung up, no agent ever connected -> no ticket (filtered noise).
-    r = post(client, _event("hangup", duration=8000))
-    assert "ignored" in r.json()
-    assert len(client.fake.posts) == 0
-
-
-def test_queue_connect_without_agent_creates_no_ticket(client):
-    # Caller reaches the IVR/queue (target is the call center, not an agent) and
-    # never gets to a person -> no ticket. This is the menu-disconnect case.
-    entry = _event("connected", call_id="ROOT")
-    entry["target"] = {"type": "callcenter", "name": "IT - All Agents"}
-    r = post(client, entry)
-    assert "ignored" in r.json()
-    assert len(client.fake.posts) == 0
-    # ...and if it then hangs up in the menu, still nothing.
-    post(client, _event("hangup", call_id="ROOT"))
-    assert len(client.fake.posts) == 0
-
+# ---- recap / voicemail attachments ----------------------------------------
 
 def test_recap_event_attaches_summary(client):
-    post(client, _event("connected"))
-    post(client, _event("recap_summary",
-                         recap_summary="Caller couldn't reach the VPN; reset their token.",
+    post(client, _answered(master_call_id="M"))
+    post(client, _event("recap_summary", call_id="LEG2", master_call_id="M",
+                         recap_summary="Caller couldn't reach the VPN; reset token.",
                          recap_action_items=["Follow up on VPN cert rotation"]))
     bodies = [p[1]["json"]["ticket"]["comment"]["body"] for p in client.fake.puts]
     assert any("couldn't reach the VPN" in b for b in bodies)
@@ -257,21 +273,14 @@ def test_recap_event_attaches_summary(client):
 
 
 def test_recap_attached_only_once(client):
-    post(client, _event("connected"))
-    post(client, _event("recap_summary", recap_summary="summary text"))
-    puts_after_first = len(client.fake.puts)
-    post(client, _event("recap_summary", recap_summary="summary text"))
-    assert len(client.fake.puts) == puts_after_first  # no duplicate attach
-
-
-def test_outbound_call_not_ticketed_by_default(client):
-    r = post(client, _event("connected", direction="outbound"))
-    assert "ignored" in r.json()
-    assert len(client.fake.posts) == 0
+    post(client, _answered(master_call_id="M"))
+    post(client, _event("recap_summary", master_call_id="M", recap_summary="s"))
+    n = len(client.fake.puts)
+    post(client, _event("recap_summary", master_call_id="M", recap_summary="s"))
+    assert len(client.fake.puts) == n
 
 
 def test_voicemail_creates_ticket_with_recording_and_transcript(client):
-    # voicemail_uploaded carries the recording link...
     r = post(client, _event("voicemail_uploaded",
                             voicemail_link="https://dialpad.com/vm/xyz"))
     body = r.json()
@@ -280,7 +289,6 @@ def test_voicemail_creates_ticket_with_recording_and_transcript(client):
     assert "voicemail" in ticket["tags"] and "missed-call" in ticket["tags"]
     assert any("dialpad.com/vm/xyz" in p[1]["json"]["ticket"]["comment"]["body"]
                for p in client.fake.puts)
-    # ...the transcription lands later on its own event.
     post(client, _event("transcription",
                         transcription_text="My laptop won't boot, please call back."))
     assert any("won't boot" in p[1]["json"]["ticket"]["comment"]["body"]
@@ -288,87 +296,68 @@ def test_voicemail_creates_ticket_with_recording_and_transcript(client):
 
 
 def test_voicemail_audio_downloaded_and_attached_as_file(client, monkeypatch):
-    # With a Dialpad token present, the bridge downloads the audio and uploads it
-    # to Zendesk, attaching the file (not just the link) — like the native one.
     monkeypatch.setattr(main, "DIALPAD_API_TOKEN", "dp-token")
     monkeypatch.setattr(main, "ATTACH_VOICEMAIL_AUDIO", True)
     post(client, _event("voicemail_uploaded",
                         voicemail_link="https://dialpad.com/secureblob/voicemail/abc"))
-    # audio fetched from the dialpad link...
     assert any("secureblob" in g[0] for g in client.fake.gets)
-    # ...uploaded to zendesk...
     assert len(client.fake.uploads) == 1
     assert client.fake.uploads[0][1]["content"] == b"FAKE-AUDIO-BYTES"
-    # ...and the upload token attached to a ticket comment.
     assert any(p[1]["json"]["ticket"]["comment"].get("uploads") == ["uptoken-1"]
                for p in client.fake.puts)
 
 
 def test_voicemail_recording_attached_only_once(client):
     post(client, _event("voicemail_uploaded", voicemail_link="https://dialpad.com/vm/xyz"))
-    puts = len(client.fake.puts)
+    n = len(client.fake.puts)
     post(client, _event("voicemail_uploaded", voicemail_link="https://dialpad.com/vm/xyz"))
-    assert len(client.fake.puts) == puts  # no duplicate recording comment
+    assert len(client.fake.puts) == n
 
+
+# ---- requester (caller) ----------------------------------------------------
+
+def test_unknown_caller_creates_customer_as_requester(client):
+    r = post(client, _answered())
+    assert "created" in r.json()
+    assert len(client.fake.created_users) == 1
+    created = client.fake.created_users[0]
+    assert created["payload"]["name"] == "Jane Tech"
+    assert created["payload"]["phone"] == "+15551112222"
+    assert "external_id" not in created["payload"]      # mergeable (no external_id)
+    assert client.fake.posts[0][1]["json"]["ticket"]["requester_id"] == created["id"]
+
+
+def test_existing_customer_matched_by_phone_is_requester(client):
+    client.fake.users_by_phone["5551112222"] = {"id": 777, "phone": "+1 (555) 111-2222"}
+    post(client, _answered())
+    assert client.fake.posts[0][1]["json"]["ticket"]["requester_id"] == 777
+    assert client.fake.created_users == []
+
+
+def test_unknown_caller_without_name_falls_back_to_phone(client):
+    ev = _event("voicemail_uploaded", voicemail_link="https://x/vm")
+    ev["contact"] = {"phone": "+15553334444", "type": "user"}
+    post(client, ev)
+    assert client.fake.created_users[0]["payload"]["name"] == "+15553334444"
+
+
+# ---- config robustness -----------------------------------------------------
 
 def test_cfg_strips_inline_comment_left_in_env(monkeypatch):
-    # docker env_file keeps inline comments; _cfg must drop them.
     monkeypatch.setenv("SOME_FLAG", "true   # only ticket internal")
     assert main._cfg("SOME_FLAG", "x") == "true"
     monkeypatch.setenv("SOME_FLAG", "")
     assert main._cfg("SOME_FLAG", "x") == ""
 
 
-def test_polluted_group_id_does_not_crash_ticket_creation(client, monkeypatch):
-    # The real-world bug: ZENDESK_GROUP_ID held the example's comment text.
+def test_polluted_group_id_does_not_crash(client, monkeypatch):
     monkeypatch.setattr(main, "DEFAULT_GROUP_ID", "# optional: route auto-tickets")
-    r = post(client, _event("connected"))
-    assert "created" in r.json()                      # no 500
+    r = post(client, _answered())
+    assert "created" in r.json()
     assert "group_id" not in client.fake.posts[0][1]["json"]["ticket"]
 
 
 def test_numeric_group_id_is_applied(client, monkeypatch):
     monkeypatch.setattr(main, "DEFAULT_GROUP_ID", "12345")
-    post(client, _event("connected"))
+    post(client, _answered())
     assert client.fake.posts[0][1]["json"]["ticket"]["group_id"] == 12345
-
-
-def test_unknown_caller_creates_customer_as_requester(client):
-    # No existing user for the caller -> create a customer (NOT default to the
-    # API account), using the caller ID + phone, and make them the requester.
-    r = post(client, _event("connected"))
-    assert "created" in r.json()
-    assert len(client.fake.created_users) == 1
-    created = client.fake.created_users[0]
-    assert created["payload"]["name"] == "Jane Tech"
-    assert created["payload"]["phone"] == "+15551112222"
-    assert client.fake.posts[0][1]["json"]["ticket"]["requester_id"] == created["id"]
-
-
-def test_existing_customer_matched_by_phone_is_requester(client):
-    client.fake.users_by_phone["5551112222"] = {"id": 777, "phone": "+1 (555) 111-2222"}
-    post(client, _event("connected"))
-    assert client.fake.posts[0][1]["json"]["ticket"]["requester_id"] == 777
-    assert client.fake.created_users == []   # reused existing, didn't create
-
-
-def test_unknown_caller_without_name_falls_back_to_phone(client):
-    ev = _event("voicemail_uploaded", voicemail_link="https://x/vm")
-    ev["contact"] = {"phone": "+15553334444", "type": "user"}   # no caller-ID name
-    post(client, ev)
-    assert client.fake.created_users[0]["payload"]["name"] == "+15553334444"
-
-
-def test_external_caller_is_skipped(client):
-    # contact.type != "user" => external; native integration handles it.
-    ev = _event("connected")
-    ev["contact"] = {"name": "Acme Corp", "phone": "+18005550000", "type": "google"}
-    r = post(client, ev)
-    assert "ignored" in r.json() and "external" in r.json()["ignored"]
-    assert len(client.fake.posts) == 0
-
-
-def test_event_without_call_id_is_ignored(client):
-    r = client.post("/dialpad/webhook", json={"state": "connected"})
-    assert r.json() == {"ignored": "no call_id/state"}
-    assert len(client.fake.posts) == 0
