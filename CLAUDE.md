@@ -1,260 +1,203 @@
-# CLAUDE.md — Project Operational Rules
+# CLAUDE.md — Dialpad → Zendesk Bridge
 
-> Drop this file in the root of any repo. Claude reads it automatically at session start.
-> Customize the stack-specific sections (marked with `# TODO`) for your project.
+A small FastAPI webhook bridge that creates **Zendesk** tickets for **internal**
+Dialpad calls. Dialpad's native Zendesk integration logs *external* calls only,
+so internal Dialpad-to-Dialpad calls (BPI's internal IT help desk) never get
+tickets. This bridge subscribes to Dialpad's raw Call Events (which fire for
+internal calls too) and creates the tickets itself — supplementing, not
+replacing, the native integration.
+
+> Treat as production-supporting tooling. It writes real tickets into a live
+> Zendesk instance. Be surgical.
 
 ---
 
-## Start Here (New Session Orientation)
+## Start Here (new session)
 
-Before touching any code:
-
-1. Read any `docs/` files relevant to the task — architecture decisions, status docs, changelogs.
-2. Run the existing test suite. Know the baseline **before** making changes.
-3. Identify what files the task actually touches. Read them. Don't guess at structure.
-4. Define success criteria out loud before writing a single line.
+1. Read this file and `README.md`.
+2. Make a venv and run the tests — know the baseline before changing anything:
+   ```bash
+   python -m venv .venv && ./.venv/bin/pip install -r requirements-dev.txt
+   ./.venv/bin/python -m pytest -q          # expect: 30 passed
+   ```
+3. Read the file you're about to change. The whole request-handling flow lives in
+   `app/main.py:dialpad_webhook`.
+4. Dialpad field names have bitten us repeatedly — **verify against a real payload
+   (set `DEBUG_PAYLOAD=true`) before trusting any field**, don't assume from docs.
 
 ---
 
 ## Tech Stack
 
-<!-- # TODO: Fill this in for your project -->
-
-- **Language / runtime:**
-- **Framework:**
-- **Database:**
-- **Test runner:**
-- **CI/CD:**
-
----
-
-# Operational Rules
-
-## Rule 1 — Think Before Coding
-
-State assumptions explicitly. Ask rather than guess.
-Push back when a simpler approach exists. Stop when confused.
-For any stateful, async, or networked work: define the exact test scenario
-and pass criteria BEFORE writing a single line.
-
-## Rule 2 — Simplicity First
-
-Minimum code that solves the problem. Nothing speculative.
-No abstractions for single-use code.
-
-**Exception:** state machines, reconnection logic, and security-critical paths —
-prefer explicit and complete over brief. Edge cases matter there.
-
-## Rule 3 — Surgical Changes
-
-Touch only what you must. Don't improve adjacent code.
-Match existing style. Don't refactor what isn't broken.
-If a refactor is warranted, call it out separately — don't slip it into a fix.
-
-## Rule 4 — Goal-Driven Execution
-
-Define success criteria before starting. Loop until verified.
-Strong, measurable success criteria let Claude work autonomously.
-
-## Rule 5 — Read Before You Write
-
-Before adding code, read exports, immediate callers, and shared utilities.
-If unsure why existing code is structured a certain way, ask.
-Always read the full file before modifying any stateful module.
-
-## Rule 6 — Checkpoint After Every Significant Step
-
-Summarize what was done, what's verified, what's left.
-Don't continue from a state you can't describe back.
-If a fix attempt fails, document WHY before trying the next approach.
-
-## Rule 7 — Surface Conflicts, Don't Average Them
-
-If two patterns contradict, pick one (more recent / more tested).
-Explain why. Flag the other for cleanup.
-Never silently blend two conflicting approaches.
-
-## Rule 8 — No Silent Regressions
-
-After any change, explicitly state which test suite areas could be affected
-and need re-verification. Surprising coupling is common — don't assume
-unrelated code is safe.
-
-## Rule 9 — Fail Loud
-
-"Completed" is wrong if anything was skipped silently.
-"Tests pass" is wrong if any were skipped or excluded.
-If a fix cannot be verified without a specific environment or device, say so.
-Default to surfacing uncertainty, not hiding it.
-
-## Rule 10 — Match the Codebase Conventions
-
-Conformance over taste. Match the logging style, naming style, and module
-structure already in use. If you think a convention is harmful, surface it.
-Don't fork silently.
-
-## Rule 11 — Advisor Escalation
-
-If the same bug has had 3+ failed fix attempts, stop.
-Document the failure chain, then escalate to a stronger model or load a
-debugging-focused system prompt before attempt 4.
-Don't run the same approach a fourth time hoping for a different result.
-
-## Rule 12 — Token Budget Awareness
-
-If a task is running significantly longer than expected, checkpoint,
-summarize progress, and re-evaluate before continuing.
-Don't silently overrun. Surface the breach and ask whether to continue.
+- **Language / runtime:** Python 3.12 (FastAPI + uvicorn)
+- **HTTP client:** httpx
+- **Auth:** Dialpad webhook JWT (HS256, PyJWT); Zendesk basic auth (email/token)
+- **State:** SQLite (stdlib `sqlite3`), volume-mounted at `/data/state.db`
+- **Test runner:** pytest (HTTP fully mocked — no network/creds needed)
+- **Packaging / deploy:** Docker Compose (bridge + cloudflared); Cloudflare Tunnel
+  for the public URL
+- **CI/CD:** none yet — tests are run locally / pre-push. Wire CI when convenient.
 
 ---
 
-# CI/CD & Testing Rules
+## How it works (the flow)
 
-These rules are ALWAYS active — even when CI is broken, unavailable, or
-not yet set up. Claude is expected to write and maintain tests as a core
-part of every task, not as an optional follow-up.
+`POST /dialpad/webhook` (`app/main.py`) decodes the event (JWT if a secret is set,
+else plain JSON), then:
 
-## T1 — Tests Are Not Optional
-
-Every bug fix ships with a regression test that would have caught it.
-Every new feature ships with tests covering the happy path and the
-primary failure modes.
-"I'll add tests later" is not an acceptable deliverable state.
-
-## T2 — Own the Test Suite — Don't Wait for CI
-
-If CI is broken, unavailable, or not configured:
-- Run tests locally and report results explicitly.
-- Write tests anyway. The test file is the artifact.
-- Note that CI needs to be wired up and flag it — don't silently skip.
-
-Claude should proactively write or update tests without being asked
-whenever it modifies behavior, fixes a bug, or adds a feature.
-This is the default behavior, not a special mode.
-
-## T3 — Know the Baseline Before Touching Anything
-
-Before any code change:
-```
-<run the test command here — e.g., npm test / pytest / go test ./...>
-```
-Record the result: `X passing, Y failing, Z skipped`.
-Any regression introduced by your changes is your responsibility to fix
-before declaring the work done.
-
-## T4 — Regression Tests Must Be Specific
-
-A regression test must:
-- Reproduce the exact scenario that caused the bug
-- Assert the specific output or state that was wrong
-- Pass only after the fix, not before
-
-Vague "smoke tests" don't count as regression coverage.
-
-## T5 — Test Near the Behavior, Not the Implementation
-
-Test public interfaces and observable outcomes.
-Don't assert internal state or private method calls unless the whole
-point is to guard an internal contract.
-Tests that break on every refactor aren't protecting you — they're
-slowing you down.
-
-## T6 — Write Tests That Can Run Without a Human Present
-
-Tests must not require manual steps, human confirmation, or a
-specific developer machine state to pass.
-If a test needs an external service, mock it or mark it as integration-only
-and skip it in the standard suite.
-
-## T7 — Test File Naming and Location
-
-<!-- # TODO: Customize for your project's conventions -->
-
-Default conventions (adjust to match the existing project structure):
-- Unit tests: co-located with the module (`foo.test.ts`, `test_foo.py`)
-- Integration tests: `tests/integration/`
-- End-to-end tests: `tests/e2e/`
-- Fixtures / mocks: `tests/fixtures/`
-
-If the project has an existing pattern, match it exactly.
-
-## T8 — CI Failures Block Merges
-
-If CI is configured and a pipeline is failing:
-- Do not ask the human to merge anyway.
-- Fix the pipeline or explicitly state what needs to be fixed and why
-  it's out of scope for this task.
-- A failing CI pipeline is a first-class bug, not background noise.
-
-## T9 — Flag Untestable Code
-
-If a piece of code genuinely can't be tested without a physical device,
-third-party hardware, or a live external service:
-- Say so explicitly.
-- Write tests for everything around it that CAN be tested.
-- Stub or mock the boundary so the surrounding logic is covered.
-
-## T10 — Keep the Test Suite Fast
-
-Tests that take >5s each slow down the feedback loop for everyone.
-Heavy tests (DB, network, E2E) belong in a separate suite that runs
-on a slower cadence (pre-push or CI-only), not in the fast unit suite
-that runs on every save.
+1. **Key the call on `master_call_id`** (falls back to `entry_point_call_id`, then
+   `call_id`). One real call rings/transfers through many legs, each with its own
+   `call_id`, but all share `master_call_id` → **one ticket per call**.
+2. **Attach-only signals** (recap, voicemail recording, transcription) are applied
+   first; they no-op if no ticket exists yet, so they're safe for any leg.
+3. **Filters:** `TICKET_ON` (direction) and `INTERNAL_ONLY` (only `contact.type`
+   in `INTERNAL_CONTACT_TYPES`, default `user`) — external callers are left to the
+   native integration so we never double-ticket.
+4. **Two-phase creation:**
+   - **Phase 1 — `connected`:** if an agent truly answered (`date_connected` set
+     AND (`operator_call_id` set OR `target.type == user`)) → create the ticket,
+     resolve + assign the answering agent. Re-assigns on every answered connected
+     (last-answerer-owns).
+   - **Phase 2 — `hangup`:** append the call length to the subject. If no ticket
+     exists yet (connected was missed), create as a **fallback** using the same
+     answered guard. The two phases are independently recoverable.
+   - **Voicemail — `voicemail_uploaded`:** always create a `voicemail` ticket.
 
 ---
 
-# Failure Modes to Avoid
+## Cases covered / what works (all unit-tested, HTTP mocked)
 
-Document project-specific failure modes here as they're discovered.
-Format: what happened, why it happened, how to not do it again.
+**Ticket creation**
+- ✅ Agent-answered call → one ticket, on answer (`connected`).
+- ✅ Contact-center / **transferred** call (rings through multiple call centers) →
+  still **one** ticket, deduped on `master_call_id`.
+- ✅ `hangup` **fallback** create if the `connected` event was missed.
+- ✅ Voicemail (incl. after-hours department voicemail) → ticket.
+- ✅ Menu-disconnect / IVR-abandon / ring-and-hangup → **no ticket** (they never
+  set the answer fields). This was real noise we deliberately filter.
+- ✅ Outbound calls and external callers → skipped.
 
-<!-- # TODO: Add entries as you discover them -->
+**Assignment**
+- ✅ Direct answer: agent is `target` (`type==user`) → assigned by email match.
+- ✅ Contact-center answer: `target` is the call center; the agent is a separate
+  operator leg fetched via `operator_call_id` (`GET /api/v2/call/{id}`) → assigned.
+- ✅ Transfers: re-assign to whoever last answered.
+- ✅ No agent resolvable → ticket left unassigned in the default (Support) group.
 
-Example format:
-```
-- **[Short name]:** What went wrong. Root cause. The rule it implies going forward.
-```
+**Requester (caller)**
+- ✅ Matched to an existing Zendesk customer by phone (exact, last-10-digit match).
+- ✅ Otherwise a new customer is created from the caller ID / phone — never falls
+  back to the API account.
+- ✅ Created customers carry **no `external_id`** so they stay mergeable (Dialpad
+  can have stale info, e.g. a changed email → a duplicate that must be mergeable).
 
----
-
-# Files — Do Not Touch Without Discussion
-
-List files or patterns here that are load-bearing, cross-cutting, or
-easy to break in non-obvious ways.
-
-<!-- # TODO: Add project-specific entries -->
-
-Examples of things that belong here:
-- Wire protocol definitions shared across multiple processes/services
-- Auth middleware or session handling
-- Database migration files (once applied, don't edit — add a new migration)
-- Build tool config files where small changes have large blast radius
-
----
-
-# Deployment Notes
-
-<!-- # TODO: Fill in for your project -->
-
-- **How to deploy:**
-- **Branch conventions:**
-- **Environment variables:**
-- **Database migrations:**
-
----
-
-# Autonomous / Long-Running Session Rules
-
-When running without a human in the loop (overnight runs, multi-step
-implementations, subagent-driven tasks):
-
-- Compact context at ~50% usage, not at 90%. Late compacts are slow and lossy.
-- Before compacting: finish or document in-flight work, commit pending changes,
-  write a brief status note so the post-compact session can re-orient.
-- Never compact with a hanging background process.
-- Treat a brief in `docs/plans/<task>-status.md` as a handoff note to your
-  future self. Write it like the next session won't remember anything.
+**Content**
+- ✅ Subject: `Dialpad call with {caller} — answered by {agent} · {length}`
+  (length from `talk_time`, appended at hangup). Voicemail:
+  `Dialpad voicemail from {caller}`.
+- ✅ Call center added as a **slugged tag** (`it_technical_support`), like native.
+- ✅ `(Don't Call)` marker stripped from subject, body, and tag.
+- ✅ First comment: clean Caller / Receiver / Call center breakdown (private note).
+- ✅ Answered calls get the Dialpad **AI recap** (`recap_summary`) as a comment.
+- ✅ Voicemails get the **audio file** (downloaded from `voicemail_link`, re-
+  uploaded to Zendesk Uploads API) + the **transcription** (`transcription_text`).
+  Falls back to a link if no `DIALPAD_API_TOKEN`.
 
 ---
 
-*Last updated: <!-- date --> | Maintainer: <!-- name -->*
+## Verified Dialpad payload facts (don't re-learn these the hard way)
+
+- `master_call_id` — present on **every** leg incl. transfers → the dedup key.
+  `entry_point_call_id` was **null** in practice; don't rely on it.
+- Answered contact-center leg has `target.type == "call_center"` (underscore!),
+  **not** `user`. The agent is a separate leg in `operator_call_id`, and that leg
+  is **not always delivered** to our subscriptions → fetch it.
+- `date_connected` is set when an agent picks up; `talk_time` (ms) is real agent
+  talk time (excludes IVR/queue/ring) and is only populated at `hangup`.
+- `duration` / `total_duration` **include IVR menu time** — misleading for "how
+  long was the call." Use `talk_time`.
+- Voicemail: `voicemail_link` (secureblob URL, needs the API token to download),
+  `transcription_text`, on `voicemail_uploaded` / `transcription` states.
+- Recording links are `recording_details[].url` (NOT `recording_url`). Need the
+  `recordings_export` scope on the API key.
+- The internal-vs-external signal is `contact.type` (`user` = internal).
+
+---
+
+## Run / Deploy
+
+- **Repo:** github.com/alext8900/dialpad-zendesk-bridge (public; **no secrets** in
+  it — `.env` is gitignored).
+- **Server:** Windows Docker host (`C:\docker\dialpad-zendesk-bridge`). Workflow:
+  push here → `git pull` on the server → `docker compose up -d --build`.
+- **Public URL:** Cloudflare Tunnel (`cloudflared` service in compose, token in
+  `.env`) → `https://dialpad.bpiteam.com/dialpad/webhook`.
+- **One-time setup:** `list_dialpad_targets.py` to find IDs →
+  `setup_dialpad.py` to register the webhook + per-target subscriptions
+  (`IT_TARGETS`). Scope = IT Department (after-hours voicemail) + 3 IT contact
+  centers. See README for the exact commands.
+- **Config:** all via `.env` (see `.env.example`). `ZENDESK_GROUP_ID` stays blank
+  (Support is the default group). `DEBUG_PAYLOAD=true` logs full event payloads.
+
+---
+
+## Files — handle with care
+
+- `app/main.py` — the whole webhook state machine. Read it fully before editing.
+- `app/store.py` — SQLite dedup/flags. `init()` migrates older DBs via
+  `ALTER TABLE ADD COLUMN`; keep it idempotent. The server's `state.db` persists.
+- `docker-compose.yml` — bridge has **no host port** (Windows reserves 8080); the
+  tunnel reaches it at `bridge:8080` over the internal network. cloudflared is
+  forced to `--protocol http2` (QUIC drops packets on WSL2). Don't re-add a host
+  port mapping without a reason.
+- `.env` — never commit it. Don't add inline `# comments` after a value in a real
+  `.env`: Docker Compose `env_file` keeps them as part of the value (caused a 500).
+  `_cfg()` in `main.py` defends against this for scalar config.
+
+---
+
+## Project gotchas / failure modes (and the rule each implies)
+
+- **Unverified Dialpad fields:** every wrong assumption (`target.type==user` for
+  answered, `entry_point_call_id` for dedup, `recording_url`) caused a real miss.
+  → Verify with `DEBUG_PAYLOAD` before trusting a field.
+- **Windows host port 8080:** WinNAT reserves it; binding fails. → No host port;
+  tunnel only.
+- **cloudflared QUIC on WSL2:** intermittent 502s. → `--protocol http2`.
+- **Docker DNS after partial recreate:** `lookup bridge: no such host`. → full
+  `docker compose down && up`; cloudflared `depends_on: condition: service_healthy`.
+- **env_file inline comments** → polluted values / 500. → comments on their own
+  lines; `_cfg()` strips them defensively.
+- **Contact `external_id`** makes Zendesk contacts unmergeable. → don't set it.
+
+---
+
+## Open items / not yet done
+
+- **Yvonne duplicate (and any like it):** a contact created before the
+  `external_id` fix can't be merged until its `external_id` is cleared
+  (`PUT /users/{id}.json {"external_id":null}`), then merge. New contacts are fine.
+- **Scope/queue rule:** we don't yet branch behavior by which call center took the
+  call. Full event payloads are logged on every ticketing event (`_log_ticketing`)
+  so the right routing field (`routing_breadcrumbs`, `transferred_from`, etc.) can
+  be chosen later.
+- **"close out" on hangup** appends the length only — it does **not** set the
+  Zendesk ticket to Solved/Closed (intentional). Revisit if auto-status is wanted.
+- **CI** is not wired up. Tests are local/pre-push for now.
+- The deprecated FastAPI `@app.on_event("startup")` could move to a lifespan
+  handler (cosmetic warning only).
+
+---
+
+## Operating rules (condensed)
+
+- Smallest correct change; match existing style; don't refactor adjacent code in a
+  fix. Surgical diffs.
+- **Separate necessary bug fixes from behavior changes, and ask before changing
+  agreed behavior** (learned the hard way on create-on-answer vs create-at-hangup).
+- Every behavior change ships with a regression test. Run the suite; never claim
+  pass without fresh output. Many invariants are only observable against live
+  Dialpad/Zendesk — say so when something needs real-event verification.
+- Pushing to `main` is the deploy path (server pulls). Don't touch Cloudflare /
+  Railway / Fly infra directly; give the user the steps.
+</content>
