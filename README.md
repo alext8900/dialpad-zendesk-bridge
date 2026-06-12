@@ -15,8 +15,11 @@ internal IT help desk. This bridge subscribes to Dialpad's raw **Call Events**
   contact center fans out into many legs (each with its own `call_id`); they're
   deduped on the call-graph root (`entry_point_call_id`), so it's **one ticket per
   call**, assigned to the agent on the leg that actually answered.
-- On **hangup**: adds final call duration to the existing ticket. Does **not**
-  create a ticket on its own (an unanswered hangup is filtered out).
+- On **hangup**: appends the call length to the subject (e.g. `… · 19 min`). Does
+  **not** create a ticket on its own (an unanswered hangup is filtered out).
+- **Subject**: `Dialpad call with {caller} — answered by {agent} · {length}` for
+  answered calls, `Dialpad voicemail from {caller}` for voicemails. The first
+  comment is a clean Caller / Receiver breakdown (name, email, phone).
 - On **voicemail / voicemail_uploaded**: creates a `voicemail` ticket and attaches
   the **voicemail recording as an actual audio file** (downloaded from Dialpad and
   re-uploaded to Zendesk, like the native integration) — this is the case the

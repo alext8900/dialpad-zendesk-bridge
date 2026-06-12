@@ -196,12 +196,34 @@ def test_duplicate_connected_does_not_create_second_ticket(client):
     assert len(client.fake.posts) == 1  # still just one ticket
 
 
-def test_hangup_after_connected_enriches_not_recreates(client):
+def test_hangup_appends_call_length_to_subject(client):
     post(client, _event("connected"))
     post(client, _event("hangup", duration=42000))
     assert len(client.fake.posts) == 1          # no new ticket
-    assert len(client.fake.puts) == 1           # one enrichment update
-    assert "42s" in client.fake.puts[0][1]["json"]["ticket"]["comment"]["body"]
+    subj_puts = [p for p in client.fake.puts if "subject" in p[1]["json"]["ticket"]]
+    assert subj_puts and "42 sec" in subj_puts[-1][1]["json"]["ticket"]["subject"]
+
+
+def test_subject_format_answered_and_voicemail(client):
+    a = _event("connected")
+    a["contact"] = {"name": "Walet Jan", "phone": "+12256036216", "type": "user"}
+    a["target"] = {"type": "user", "name": "Alex Thompson", "email": "a@bpiteam.com"}
+    post(client, a)
+    assert client.fake.posts[0][1]["json"]["ticket"]["subject"] == \
+        "Dialpad call with Walet Jan — answered by Alex Thompson"
+
+    v = _event("voicemail_uploaded", call_id="vm-1", voicemail_link="https://x/vm")
+    v["contact"] = {"name": "Walet Jan", "phone": "+12256036216", "type": "user"}
+    post(client, v)
+    assert client.fake.posts[1][1]["json"]["ticket"]["subject"] == \
+        "Dialpad voicemail from Walet Jan"
+
+
+def test_long_call_length_formats_minutes(client):
+    post(client, _event("connected"))
+    post(client, _event("hangup", duration=1140000))   # 19 min
+    subj_puts = [p for p in client.fake.puts if "subject" in p[1]["json"]["ticket"]]
+    assert subj_puts and subj_puts[-1][1]["json"]["ticket"]["subject"].endswith("· 19 min")
 
 
 def test_unanswered_hangup_creates_no_ticket(client):

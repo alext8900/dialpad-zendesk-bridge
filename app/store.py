@@ -18,6 +18,7 @@ def init():
             """CREATE TABLE IF NOT EXISTS calls (
                    call_id TEXT PRIMARY KEY,
                    ticket_id INTEGER,
+                   subject TEXT,
                    recap_done INTEGER DEFAULT 0,
                    enriched INTEGER DEFAULT 0,
                    vm_link_done INTEGER DEFAULT 0,
@@ -32,6 +33,10 @@ def init():
                 c.execute(f"ALTER TABLE calls ADD COLUMN {col} INTEGER DEFAULT 0")
             except sqlite3.OperationalError:
                 pass  # column already exists
+        try:
+            c.execute("ALTER TABLE calls ADD COLUMN subject TEXT")
+        except sqlite3.OperationalError:
+            pass
 
 
 def get_ticket(call_id: str):
@@ -42,12 +47,20 @@ def get_ticket(call_id: str):
         return row[0] if row else None
 
 
-def save_ticket(call_id: str, ticket_id: int):
+def save_ticket(call_id: str, ticket_id: int, subject: str = None):
     with _conn() as c:
         c.execute(
-            "INSERT OR IGNORE INTO calls (call_id, ticket_id) VALUES (?, ?)",
-            (call_id, ticket_id),
+            "INSERT OR IGNORE INTO calls (call_id, ticket_id, subject) VALUES (?, ?, ?)",
+            (call_id, ticket_id, subject),
         )
+
+
+def get_subject(call_id: str):
+    with _conn() as c:
+        row = c.execute(
+            "SELECT subject FROM calls WHERE call_id = ?", (call_id,)
+        ).fetchone()
+        return row[0] if row else None
 
 
 def recap_done(call_id: str) -> bool:

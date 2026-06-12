@@ -157,20 +157,21 @@ async def dialpad_webhook(request: Request):
         if store.get_ticket(key) is None:
             if not (answered or voicemail):
                 return {"ignored": "no agent answered (and not voicemail)"}
-            ticket_id = _create_ticket(event, answered=answered, voicemail=voicemail)
-            store.save_ticket(key, ticket_id)
+            ticket_id, subject = _create_ticket(event, answered=answered,
+                                                voicemail=voicemail)
+            store.save_ticket(key, ticket_id, subject)
             _attach_extras(key, event)
             if state in TERMINAL_STATES:
-                store.mark_enriched(key)
+                store.mark_enriched(key)  # voicemail terminal: no length to add
             if answered:
                 _maybe_assign(key, event)
             return {"created": ticket_id, "answered": answered, "voicemail": voicemail}
 
         # Ticket already exists for this call. Later legs still tell us things:
-        # the operator leg that connected = who answered; terminal = final duration.
+        # the operator leg that connected = who answered; hangup = call length.
         if state == "connected":
             _maybe_assign(key, event)
-        if state in TERMINAL_STATES:
+        if state == "hangup":
             _maybe_enrich(key, event)
 
     return {"ok": state}
@@ -334,44 +335,73 @@ def _zendesk_upload(filename: str, data: bytes, content_type: str) -> str:
     return r.json()["upload"]["token"]
 
 
-def _create_ticket(event: dict, answered: bool, voicemail: bool = False) -> int:
-    contact = event.get("contact") or {}
-    caller = contact.get("name") or contact.get("phone") or "Unknown caller"
-    target = (event.get("target") or {}).get("name") or "IT"
+def _fmt_duration(ms) -> str:
+    secs = round((ms or 0) / 1000)
+    if secs < 60:
+        return f"{secs} sec"
+    m, s = divmod(secs, 60)
+    return f"{m} min" if s == 0 else f"{m} min {s} sec"
+
+
+def _caller_name(event: dict) -> str:
+    c = event.get("contact") or {}
+    return c.get("name") or c.get("phone") or "Unknown caller"
+
+
+def _receiver_name(event: dict) -> str:
+    """Agent who took it, prefixed with the queue if we know it (e.g.
+    'IT - Technical Support / Alex Thompson')."""
+    agent = (event.get("target") or {}).get("name") or "IT"
+    queue = (event.get("entry_point_target") or {}).get("name")
+    return f"{queue} / {agent}" if queue and queue != agent else agent
+
+
+def _subject(event: dict, answered: bool, voicemail: bool) -> str:
+    caller = _caller_name(event)
     if voicemail:
-        status_word, status_desc = "Voicemail", "voicemail"
-    elif answered:
-        status_word, status_desc = "Call", "answered"
-    else:
-        status_word, status_desc = "Missed call", "missed / no voicemail"
+        return f"Dialpad voicemail from {caller}"
+    return f"Dialpad call with {caller} — answered by {_receiver_name(event)}"
 
-    body = (
-        f"Auto-created from a Dialpad internal call.\n\n"
-        f"Caller: {caller} ({contact.get('phone', 'n/a')})\n"
-        f"Direction: {event.get('direction')}\n"
-        f"Status: {status_desc}\n"
-        f"Dialpad call_id: {event.get('call_id')}"
-    )
-    if not answered and event.get("duration"):
-        body += f"\nDuration: {round(event['duration'] / 1000)}s"
 
+def _render_body(event: dict, answered: bool, voicemail: bool) -> str:
+    contact = event.get("contact") or {}
+    target = event.get("target") or {}
+    header = _subject(event, answered, voicemail)
+    lines = [header, "", f"Direction: {(event.get('direction') or 'n/a').title()}",
+             "", "— Caller —", f"Name: {contact.get('name') or '—'}"]
+    if contact.get("email"):
+        lines.append(f"Email: {contact['email']}")
+    if contact.get("phone"):
+        lines.append(f"Phone: {contact['phone']}")
+    lines += ["", "— Receiver —", f"Name: {_receiver_name(event)}"]
+    if target.get("email"):
+        lines.append(f"Email: {target['email']}")
+    if target.get("phone"):
+        lines.append(f"Phone: {target['phone']}")
+    if voicemail:
+        lines += ["", "(voicemail recording & transcription attached below)"]
+    lines += ["", f"Dialpad call id: {event.get('call_id')}"]
+    return "\n".join(lines)
+
+
+def _create_ticket(event: dict, answered: bool, voicemail: bool = False):
+    """Returns (ticket_id, subject). Subject gets the call length appended later
+    on hangup (see _maybe_enrich)."""
+    subject = _subject(event, answered, voicemail)
     tags = ["dialpad", "internal-call"]
     if voicemail:
         tags += ["voicemail", "missed-call"]
-    elif not answered:
-        tags += ["missed-call"]
 
     ticket = {
-        "subject": f"{status_word} from {caller} -> {target}",
-        "comment": {"body": body, "public": False},
+        "subject": subject,
+        "comment": {"body": _render_body(event, answered, voicemail), "public": False},
         "tags": tags,
     }
     rid = _requester_id(event)
     if rid:
         ticket["requester_id"] = rid
     # Assignment happens separately via _maybe_assign once we see the operator
-    # leg that actually answered (the creating leg may be the queue, not an agent).
-    # Voicemails/missed stay unassigned -> default (Support) group.
+    # leg that actually answered. Voicemails stay unassigned -> default group.
     if DEFAULT_GROUP_ID.isdigit():
         ticket["group_id"] = int(DEFAULT_GROUP_ID)
 
@@ -379,25 +409,24 @@ def _create_ticket(event: dict, answered: bool, voicemail: bool = False) -> int:
                    auth=ZAUTH, timeout=15)
     r.raise_for_status()
     tid = r.json()["ticket"]["id"]
-    log.info("created ticket %s (answered=%s) for call %s", tid, answered,
-             event.get("call_id"))
-    return tid
+    log.info("created ticket %s (answered=%s voicemail=%s) for call %s",
+             tid, answered, voicemail, event.get("call_id"))
+    return tid, subject
 
 
 def _maybe_enrich(call_id: str, event: dict):
-    """Once the call ends, add final duration/disposition to a ticket that was
-    created at answer time (when those weren't known yet)."""
+    """When the call ends, append the call length to the subject (it wasn't known
+    at answer time): 'Dialpad call with X — answered by Y · 19 min'."""
     ticket_id = store.get_ticket(call_id)
     if not ticket_id or store.is_enriched(call_id):
         return
-    secs = round((event.get("duration") or 0) / 1000)
-    dispo = event.get("call_dispositions")
-    body = f"Call ended. Duration: {secs}s"
-    if dispo:
-        body += f"\nDisposition: {dispo}"
-    _comment(ticket_id, body)
+    base = store.get_subject(call_id)
+    dur = event.get("duration")
+    if base and dur:
+        _update_ticket(ticket_id, {"subject": f"{base} · {_fmt_duration(dur)}"})
+        log.info("set length on ticket %s (call %s): %s", ticket_id, call_id,
+                 _fmt_duration(dur))
     store.mark_enriched(call_id)
-    log.info("enriched ticket %s (call %s)", ticket_id, call_id)
 
 
 def _maybe_attach_voicemail(call_id: str, event: dict):
