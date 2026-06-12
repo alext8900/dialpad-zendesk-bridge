@@ -189,14 +189,15 @@ else plain JSON), then:
 
 ---
 
-## Operating rules (condensed)
+## Operating rules
 
-- Smallest correct change; match existing style; don't refactor adjacent code in a
-  fix. Surgical diffs.
-- **Separate necessary bug fixes from behavior changes, and ask before changing
+The full operating rules (Rules 1–12, CI/CD & Testing rules T1–T10, autonomous
+session rules) live in **[docs/OPERATING_RULES.md](docs/OPERATING_RULES.md)** —
+read and follow them. Project-specific additions on top of those:
+
+- **Separate necessary bug fixes from behavior changes, and ASK before changing
   agreed behavior** (learned the hard way on create-on-answer vs create-at-hangup).
-- Every behavior change ships with a regression test. Run the suite; never claim
-  pass without fresh output. Many invariants are only observable against live
-  Dialpad/Zendesk — say so when something needs real-event verification.
+- Dialpad field names have burned us — verify against a real payload
+  (`DEBUG_PAYLOAD=true`) before trusting any field; don't assume from docs.
 - Pushing to `main` is the deploy path (server pulls). Don't touch Cloudflare /
   Railway / Fly infra directly; give the user the steps.
