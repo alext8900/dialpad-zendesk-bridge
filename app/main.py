@@ -31,18 +31,31 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("bridge")
 
 # ---- Config (see .env.example) ---------------------------------------------
-DIALPAD_WEBHOOK_SECRET = os.environ.get("DIALPAD_WEBHOOK_SECRET", "")
-ZENDESK_SUBDOMAIN = os.environ["ZENDESK_SUBDOMAIN"]
-ZENDESK_EMAIL = os.environ["ZENDESK_EMAIL"]
-ZENDESK_API_TOKEN = os.environ["ZENDESK_API_TOKEN"]
-TICKET_ON = os.environ.get("TICKET_ON", "inbound")      # inbound | outbound | both
-DEFAULT_GROUP_ID = os.environ.get("ZENDESK_GROUP_ID")
+def _cfg(name: str, default: str = "") -> str:
+    """Read an env var, tolerating an inline '# comment' accidentally left in a
+    .env value. Docker Compose's env_file does NOT strip inline comments, so
+    `KEY=value   # note` arrives as 'value   # note' — guard against that."""
+    v = os.environ.get(name, default)
+    if v is None:
+        return default
+    i = v.find(" #")
+    if i != -1:
+        v = v[:i]
+    return v.strip()
+
+
+DIALPAD_WEBHOOK_SECRET = _cfg("DIALPAD_WEBHOOK_SECRET")
+ZENDESK_SUBDOMAIN = _cfg("ZENDESK_SUBDOMAIN") or os.environ["ZENDESK_SUBDOMAIN"]
+ZENDESK_EMAIL = _cfg("ZENDESK_EMAIL") or os.environ["ZENDESK_EMAIL"]
+ZENDESK_API_TOKEN = _cfg("ZENDESK_API_TOKEN") or os.environ["ZENDESK_API_TOKEN"]
+TICKET_ON = _cfg("TICKET_ON", "inbound") or "inbound"   # inbound | outbound | both
+DEFAULT_GROUP_ID = _cfg("ZENDESK_GROUP_ID")             # numeric string or "" (ignored)
 # Dialpad API token (needs the 'recordings'/'recordings_export' scope) so the
 # bridge can DOWNLOAD the voicemail audio and re-upload it to Zendesk as a real
 # file attachment, like the native integration does. Without it, the bridge falls
 # back to dropping the voicemail_link as a comment.
-DIALPAD_API_TOKEN = os.environ.get("DIALPAD_API_TOKEN", "")
-ATTACH_VOICEMAIL_AUDIO = os.environ.get("ATTACH_VOICEMAIL_AUDIO", "true").lower() == "true"
+DIALPAD_API_TOKEN = _cfg("DIALPAD_API_TOKEN")
+ATTACH_VOICEMAIL_AUDIO = _cfg("ATTACH_VOICEMAIL_AUDIO", "true").lower() == "true"
 # States that should result in a ticket. 'connected' = answered (instant ticket).
 # 'hangup'/'voicemail' = safety net so missed calls still get a ticket. Drop
 # 'hangup' here if you DON'T want tickets for abandoned calls with no voicemail.
@@ -54,10 +67,10 @@ TERMINAL_STATES = {"hangup", "voicemail", "voicemail_uploaded"}
 # would double up. An internal caller has contact.type == "user"; external
 # callers are local/google/nylas/microsoft. Override the type set if your tenant
 # differs (e.g. include 'room'); set INTERNAL_ONLY=false to ticket everything.
-INTERNAL_ONLY = os.environ.get("INTERNAL_ONLY", "true").lower() == "true"
+INTERNAL_ONLY = _cfg("INTERNAL_ONLY", "true").lower() == "true"
 INTERNAL_CONTACT_TYPES = {
     t.strip().lower()
-    for t in os.environ.get("INTERNAL_CONTACT_TYPES", "user").split(",")
+    for t in _cfg("INTERNAL_CONTACT_TYPES", "user").split(",")
     if t.strip()
 }
 
@@ -268,7 +281,7 @@ def _create_ticket(event: dict, answered: bool, voicemail: bool = False) -> int:
         aid = _assignee_id(event)
         if aid:
             ticket["assignee_id"] = aid
-    if DEFAULT_GROUP_ID:
+    if DEFAULT_GROUP_ID.isdigit():
         ticket["group_id"] = int(DEFAULT_GROUP_ID)
 
     r = httpx.post(f"{ZBASE}/tickets.json", json={"ticket": ticket},

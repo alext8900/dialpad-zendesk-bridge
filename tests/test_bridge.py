@@ -226,6 +226,28 @@ def test_voicemail_recording_attached_only_once(client):
     assert len(client.fake.puts) == puts  # no duplicate recording comment
 
 
+def test_cfg_strips_inline_comment_left_in_env(monkeypatch):
+    # docker env_file keeps inline comments; _cfg must drop them.
+    monkeypatch.setenv("SOME_FLAG", "true   # only ticket internal")
+    assert main._cfg("SOME_FLAG", "x") == "true"
+    monkeypatch.setenv("SOME_FLAG", "")
+    assert main._cfg("SOME_FLAG", "x") == ""
+
+
+def test_polluted_group_id_does_not_crash_ticket_creation(client, monkeypatch):
+    # The real-world bug: ZENDESK_GROUP_ID held the example's comment text.
+    monkeypatch.setattr(main, "DEFAULT_GROUP_ID", "# optional: route auto-tickets")
+    r = post(client, _event("connected"))
+    assert "created" in r.json()                      # no 500
+    assert "group_id" not in client.fake.posts[0][1]["json"]["ticket"]
+
+
+def test_numeric_group_id_is_applied(client, monkeypatch):
+    monkeypatch.setattr(main, "DEFAULT_GROUP_ID", "12345")
+    post(client, _event("connected"))
+    assert client.fake.posts[0][1]["json"]["ticket"]["group_id"] == 12345
+
+
 def test_external_caller_is_skipped(client):
     # contact.type != "user" => external; native integration handles it.
     ev = _event("connected")
