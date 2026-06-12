@@ -147,24 +147,27 @@ async def dialpad_webhook(request: Request):
             return {"ignored": f"external caller (contact.type={contact_type or 'n/a'}); "
                                "handled by native integration"}
 
+        # We only ticket calls an AGENT actually answered (an operator leg
+        # connected -> target.type == "user") or that left a VOICEMAIL. Calls
+        # that died in the IVR menu or rang and hung up never produce an agent
+        # connect, so they don't ticket — that's the noise we're filtering.
+        answered = state == "connected" and (target.get("type") or "").lower() == "user"
+        voicemail = state in VOICEMAIL_STATES
+
         if store.get_ticket(key) is None:
-            answered = state == "connected"
-            voicemail = state in VOICEMAIL_STATES
+            if not (answered or voicemail):
+                return {"ignored": "no agent answered (and not voicemail)"}
             ticket_id = _create_ticket(event, answered=answered, voicemail=voicemail)
             store.save_ticket(key, ticket_id)
             _attach_extras(key, event)
-            # A ticket born from a terminal state already has final duration.
             if state in TERMINAL_STATES:
                 store.mark_enriched(key)
-            # If THIS leg is the one that answered, assign it now.
-            if state == "connected":
+            if answered:
                 _maybe_assign(key, event)
             return {"created": ticket_id, "answered": answered, "voicemail": voicemail}
 
         # Ticket already exists for this call. Later legs still tell us things:
         # the operator leg that connected = who answered; terminal = final duration.
-        # This is what makes one ticket land on the right agent instead of spawning
-        # a second ticket per leg.
         if state == "connected":
             _maybe_assign(key, event)
         if state in TERMINAL_STATES:

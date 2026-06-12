@@ -7,13 +7,16 @@ internal IT help desk. This bridge subscribes to Dialpad's raw **Call Events**
 
 ## What it does
 - Listens for Dialpad call events on `POST /dialpad/webhook`
-- On **connected** (answered): creates the ticket the moment the agent picks up,
-  matching the native integration's behavior. A call ringing through a contact
-  center fans out into many legs (each with its own `call_id`); they're deduped on
-  the call-graph root (`entry_point_call_id`), so it's **one ticket per call**,
-  assigned to the agent on the leg that actually answered
-- On **hangup**: safety net — creates a `missed-call` ticket for calls that rang
-  out, and adds final call duration to the answered-call ticket
+- **Only tickets calls an agent actually answered, plus voicemails.** A ticket is
+  created when an operator leg connects (`connected` with `target.type == "user"`)
+  or on a voicemail. Calls that die in the IVR menu or ring-and-hang-up never
+  produce an agent connect, so they don't ticket — that's the noise filter.
+- On **connected** (agent answered): creates the ticket. A call ringing through a
+  contact center fans out into many legs (each with its own `call_id`); they're
+  deduped on the call-graph root (`entry_point_call_id`), so it's **one ticket per
+  call**, assigned to the agent on the leg that actually answered.
+- On **hangup**: adds final call duration to the existing ticket. Does **not**
+  create a ticket on its own (an unanswered hangup is filtered out).
 - On **voicemail / voicemail_uploaded**: creates a `voicemail` ticket and attaches
   the **voicemail recording as an actual audio file** (downloaded from Dialpad and
   re-uploaded to Zendesk, like the native integration) — this is the case the
@@ -110,16 +113,13 @@ public hostname with no inbound firewall ports. One-time dashboard setup:
 - `ZENDESK_GROUP_ID` — **optional**; leave blank if your support group is the
   Zendesk *default* group (unassigned tickets land there automatically). Only set
   it to force a specific non-default group.
-- `CREATE_STATES` in `app/main.py` controls ticket timing. Default creates on
-  `connected` (answer) with `hangup`/`voicemail` as the missed-call safety net.
-  Remove `hangup` if you DON'T want tickets for abandoned calls that left no
-  voicemail; keep only `hangup` if you preferred the original answer-agnostic
-  "ticket when the call ends" behavior.
+- Tickets are created only for **agent-answered calls + voicemails** (see "What it
+  does"). Unanswered/menu-disconnect calls are intentionally filtered out.
 - State lives in `./data/state.db` (SQLite). Delete it to reset dedup memory.
 
 ## Tests
-The state machine (ticket-on-answer, dedup, missed-call safety net, enrichment,
-AI recap attach) is covered with mocked HTTP — no network or real creds needed:
+The state machine (answered-only ticketing, dedup, enrichment, AI recap +
+voicemail attach) is covered with mocked HTTP — no network or real creds needed:
 ```bash
 python -m venv .venv && ./.venv/bin/pip install -r requirements-dev.txt
 ./.venv/bin/python -m pytest -q

@@ -116,7 +116,8 @@ def _event(state, call_id="call-1", direction="inbound", **extra):
         "state": state,
         "direction": direction,
         "contact": {"name": "Jane Tech", "phone": "+15551112222", "type": "user"},
-        "target": {"name": "IT Help Desk"},
+        # default target is an agent (type=user) so a 'connected' counts as answered
+        "target": {"type": "user", "name": "IT Agent"},
     }
     ev.update(extra)
     return ev
@@ -203,13 +204,24 @@ def test_hangup_after_connected_enriches_not_recreates(client):
     assert "42s" in client.fake.puts[0][1]["json"]["ticket"]["comment"]["body"]
 
 
-def test_missed_call_creates_ticket_tagged_missed(client):
-    # Rings out / voicemail: hangup arrives with no prior 'connected'.
+def test_unanswered_hangup_creates_no_ticket(client):
+    # Rang and hung up, no agent ever connected -> no ticket (filtered noise).
     r = post(client, _event("hangup", duration=8000))
-    body = r.json()
-    assert "created" in body and body["answered"] is False
-    ticket = client.fake.posts[0][1]["json"]["ticket"]
-    assert "missed-call" in ticket["tags"]
+    assert "ignored" in r.json()
+    assert len(client.fake.posts) == 0
+
+
+def test_queue_connect_without_agent_creates_no_ticket(client):
+    # Caller reaches the IVR/queue (target is the call center, not an agent) and
+    # never gets to a person -> no ticket. This is the menu-disconnect case.
+    entry = _event("connected", call_id="ROOT")
+    entry["target"] = {"type": "callcenter", "name": "IT - All Agents"}
+    r = post(client, entry)
+    assert "ignored" in r.json()
+    assert len(client.fake.posts) == 0
+    # ...and if it then hangs up in the menu, still nothing.
+    post(client, _event("hangup", call_id="ROOT"))
+    assert len(client.fake.posts) == 0
 
 
 def test_recap_event_attaches_summary(client):
