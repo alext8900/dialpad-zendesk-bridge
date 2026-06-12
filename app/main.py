@@ -57,6 +57,8 @@ DEFAULT_GROUP_ID = _cfg("ZENDESK_GROUP_ID")             # numeric string or "" (
 # back to dropping the voicemail_link as a comment.
 DIALPAD_API_TOKEN = _cfg("DIALPAD_API_TOKEN")
 ATTACH_VOICEMAIL_AUDIO = _cfg("ATTACH_VOICEMAIL_AUDIO", "true").lower() == "true"
+# Set true to log the full Dialpad event payload (for diagnosing field names).
+DEBUG_PAYLOAD = _cfg("DEBUG_PAYLOAD", "false").lower() == "true"
 # States that should result in a ticket. 'connected' = answered (instant ticket).
 # 'hangup'/'voicemail' = safety net so missed calls still get a ticket. Drop
 # 'hangup' here if you DON'T want tickets for abandoned calls with no voicemail.
@@ -113,7 +115,13 @@ async def dialpad_webhook(request: Request):
     if not call_id or not state:
         return {"ignored": "no call_id/state"}
 
-    log.info("event call_id=%s state=%s direction=%s", call_id, state, direction)
+    contact = event.get("contact") or {}
+    target = event.get("target") or {}
+    log.info("event call_id=%s state=%s direction=%s contact=%s:%s target=%s:%s",
+             call_id, state, direction, contact.get("type"), contact.get("name"),
+             target.get("type"), target.get("name"))
+    if DEBUG_PAYLOAD:
+        log.info("payload call_id=%s %s", call_id, json.dumps(event, default=str))
 
     # Attach-only signals can arrive on their own event after the call ends
     # (AI recap, voicemail recording, voicemail transcription). They no-op
@@ -127,8 +135,10 @@ async def dialpad_webhook(request: Request):
 
         # Only ticket INTERNAL callers; the native integration handles external
         # ones, so ticketing them here would double up.
-        contact_type = ((event.get("contact") or {}).get("type") or "").lower()
+        contact_type = (contact.get("type") or "").lower()
         if INTERNAL_ONLY and contact_type not in INTERNAL_CONTACT_TYPES:
+            log.info("skip: contact.type=%r not internal (internal=%s) call_id=%s",
+                     contact_type, sorted(INTERNAL_CONTACT_TYPES), call_id)
             return {"ignored": f"external caller (contact.type={contact_type or 'n/a'}); "
                                "handled by native integration"}
 
