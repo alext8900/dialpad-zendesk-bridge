@@ -1,0 +1,203 @@
+"""
+Dialpad -> Zendesk bridge for INTERNAL calls.
+
+Dialpad's native Zendesk integration logs *external* calls only. Internal
+Dialpad-to-Dialpad calls never create tickets, which is useless for an internal
+IT help desk. The raw Call Events API fires on every call regardless, so we
+catch those events and create the ticket via the Zendesk API ourselves.
+
+Ticket timing mirrors the native integration:
+  - 'connected'         -> create the ticket the moment the call is answered
+  - 'hangup'/'voicemail'-> safety net: create a ticket for calls that never
+                           connected (missed / voicemail), and enrich the
+                           answered-call ticket with final duration
+  - 'recording'         -> attach the recording link once it's ready
+
+A tiny SQLite store maps call_id -> ticket_id so dedup and the later updates
+survive container restarts.
+"""
+
+import os
+import json
+import logging
+
+import jwt
+import httpx
+from fastapi import FastAPI, Request, HTTPException
+
+from . import store
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("bridge")
+
+# ---- Config (see .env.example) ---------------------------------------------
+DIALPAD_WEBHOOK_SECRET = os.environ.get("DIALPAD_WEBHOOK_SECRET", "")
+ZENDESK_SUBDOMAIN = os.environ["ZENDESK_SUBDOMAIN"]
+ZENDESK_EMAIL = os.environ["ZENDESK_EMAIL"]
+ZENDESK_API_TOKEN = os.environ["ZENDESK_API_TOKEN"]
+TICKET_ON = os.environ.get("TICKET_ON", "inbound")      # inbound | outbound | both
+DEFAULT_GROUP_ID = os.environ.get("ZENDESK_GROUP_ID")
+# States that should result in a ticket. 'connected' = answered (instant ticket).
+# 'hangup'/'voicemail' = safety net so missed calls still get a ticket. Drop
+# 'hangup' here if you DON'T want tickets for abandoned calls with no voicemail.
+CREATE_STATES = {"connected", "hangup", "voicemail"}
+TERMINAL_STATES = {"hangup", "voicemail"}
+
+ZBASE = f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/api/v2"
+ZAUTH = (f"{ZENDESK_EMAIL}/token", ZENDESK_API_TOKEN)
+
+app = FastAPI(title="Dialpad-Zendesk Internal Bridge")
+
+
+@app.on_event("startup")
+def _startup():
+    store.init()
+    log.info("bridge up; ticketing on '%s' calls", TICKET_ON)
+
+
+@app.get("/healthz")
+def healthz():
+    return {"ok": True}
+
+
+def _decode(raw: bytes) -> dict:
+    """Dialpad sends a JWT (HS256) when a secret is set, else plain JSON."""
+    body = raw.decode("utf-8").strip()
+    if DIALPAD_WEBHOOK_SECRET:
+        try:
+            return jwt.decode(body, DIALPAD_WEBHOOK_SECRET, algorithms=["HS256"])
+        except jwt.InvalidTokenError as e:
+            raise HTTPException(status_code=401, detail=f"bad signature: {e}")
+    return json.loads(body)
+
+
+@app.post("/dialpad/webhook")
+async def dialpad_webhook(request: Request):
+    event = _decode(await request.body())
+
+    call_id = str(event.get("call_id") or "")
+    state = event.get("state")
+    direction = event.get("direction")  # 'inbound' | 'outbound'
+    if not call_id or not state:
+        return {"ignored": "no call_id/state"}
+
+    log.info("event call_id=%s state=%s direction=%s", call_id, state, direction)
+
+    # recording can show up on its own event after the call ends
+    if event.get("recording_url"):
+        _maybe_attach_recording(call_id, event)
+
+    if state in CREATE_STATES:
+        if TICKET_ON != "both" and direction != TICKET_ON:
+            return {"ignored": f"direction {direction} not ticketed"}
+
+        if store.get_ticket(call_id) is None:
+            answered = state == "connected"
+            ticket_id = _create_ticket(event, answered=answered)
+            store.save_ticket(call_id, ticket_id)
+            if event.get("recording_url"):
+                _maybe_attach_recording(call_id, event)
+            # A ticket born from a terminal state already has final duration.
+            if state in TERMINAL_STATES:
+                store.mark_enriched(call_id)
+            return {"created": ticket_id, "answered": answered}
+
+        # Ticket already exists (created on 'connected'); fill in final details.
+        if state in TERMINAL_STATES:
+            _maybe_enrich(call_id, event)
+
+    return {"ok": state}
+
+
+def _requester_id(event: dict):
+    """Best-effort: match the internal caller to an existing Zendesk end-user
+    by phone. For an internal desk the caller is almost always already a user."""
+    contact = event.get("contact") or {}
+    phone = contact.get("phone")
+    if not phone:
+        return None
+    try:
+        r = httpx.get(f"{ZBASE}/users/search.json", params={"query": phone},
+                      auth=ZAUTH, timeout=10)
+        r.raise_for_status()
+        users = r.json().get("users", [])
+        return users[0]["id"] if users else None
+    except Exception as e:
+        log.warning("requester lookup failed for %s: %s", phone, e)
+        return None
+
+
+def _create_ticket(event: dict, answered: bool) -> int:
+    contact = event.get("contact") or {}
+    caller = contact.get("name") or contact.get("phone") or "Unknown caller"
+    target = (event.get("target") or {}).get("name") or "IT"
+    status_word = "Call" if answered else "Missed call"
+
+    body = (
+        f"Auto-created from a Dialpad internal call.\n\n"
+        f"Caller: {caller} ({contact.get('phone', 'n/a')})\n"
+        f"Direction: {event.get('direction')}\n"
+        f"Status: {'answered' if answered else 'missed / voicemail'}\n"
+        f"Dialpad call_id: {event.get('call_id')}"
+    )
+    if not answered and event.get("duration"):
+        body += f"\nDuration: {round(event['duration'] / 1000)}s"
+
+    ticket = {
+        "subject": f"{status_word} from {caller} -> {target}",
+        "comment": {"body": body, "public": False},
+        "tags": ["dialpad", "internal-call"] + ([] if answered else ["missed-call"]),
+    }
+    rid = _requester_id(event)
+    if rid:
+        ticket["requester_id"] = rid
+    if DEFAULT_GROUP_ID:
+        ticket["group_id"] = int(DEFAULT_GROUP_ID)
+
+    r = httpx.post(f"{ZBASE}/tickets.json", json={"ticket": ticket},
+                   auth=ZAUTH, timeout=15)
+    r.raise_for_status()
+    tid = r.json()["ticket"]["id"]
+    log.info("created ticket %s (answered=%s) for call %s", tid, answered,
+             event.get("call_id"))
+    return tid
+
+
+def _maybe_enrich(call_id: str, event: dict):
+    """Once the call ends, add final duration/disposition to a ticket that was
+    created at answer time (when those weren't known yet)."""
+    ticket_id = store.get_ticket(call_id)
+    if not ticket_id or store.is_enriched(call_id):
+        return
+    secs = round((event.get("duration") or 0) / 1000)
+    dispo = event.get("call_dispositions")
+    body = f"Call ended. Duration: {secs}s"
+    if dispo:
+        body += f"\nDisposition: {dispo}"
+    r = httpx.put(f"{ZBASE}/tickets/{ticket_id}.json",
+                  json={"ticket": {"comment": {"body": body, "public": False}}},
+                  auth=ZAUTH, timeout=15)
+    r.raise_for_status()
+    store.mark_enriched(call_id)
+    log.info("enriched ticket %s (call %s)", ticket_id, call_id)
+
+
+def _maybe_attach_recording(call_id: str, event: dict):
+    ticket_id = store.get_ticket(call_id)
+    if not ticket_id or store.recording_done(call_id):
+        return
+    urls = event.get("recording_url") or []
+    if isinstance(urls, str):
+        urls = [urls]
+    if not urls:
+        return
+    # Least-resistance: link(s) in a private comment. To attach the actual audio,
+    # download each URL with your Dialpad bearer token and push it through
+    # Zendesk's Uploads API, then reference the upload token here.
+    body = "Call recording(s):\n" + "\n".join(urls)
+    r = httpx.put(f"{ZBASE}/tickets/{ticket_id}.json",
+                  json={"ticket": {"comment": {"body": body, "public": False}}},
+                  auth=ZAUTH, timeout=15)
+    r.raise_for_status()
+    store.mark_recording(call_id)
+    log.info("attached recording to ticket %s (call %s)", ticket_id, call_id)
