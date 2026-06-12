@@ -8,7 +8,10 @@ internal IT help desk. This bridge subscribes to Dialpad's raw **Call Events**
 ## What it does
 - Listens for Dialpad call events on `POST /dialpad/webhook`
 - On **connected** (answered): creates the ticket the moment the agent picks up,
-  matching the native integration's behavior (deduped by `call_id`)
+  matching the native integration's behavior. A call ringing through a contact
+  center fans out into many legs (each with its own `call_id`); they're deduped on
+  the call-graph root (`entry_point_call_id`), so it's **one ticket per call**,
+  assigned to the agent on the leg that actually answered
 - On **hangup**: safety net — creates a `missed-call` ticket for calls that rang
   out, and adds final call duration to the answered-call ticket
 - On **voicemail / voicemail_uploaded**: creates a `voicemail` ticket and attaches

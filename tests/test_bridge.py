@@ -126,6 +126,15 @@ def post(client, event):
     return client.post("/dialpad/webhook", json=event)
 
 
+def _assignee_in_puts(fake):
+    """The assignee is applied via a ticket PUT (separate from creation)."""
+    for _url, kw in fake.puts:
+        aid = kw["json"]["ticket"].get("assignee_id")
+        if aid is not None:
+            return aid
+    return None
+
+
 def test_answered_call_creates_one_ticket_on_connected(client):
     r = post(client, _event("connected"))
     assert r.json()["answered"] is True
@@ -141,8 +150,35 @@ def test_answered_call_assigned_to_agent_who_picked_up(client):
     ev = _event("connected")
     ev["target"] = {"type": "user", "name": "Agent Smith", "email": "agent@demo.com"}
     post(client, ev)
-    ticket = client.fake.posts[0][1]["json"]["ticket"]
-    assert ticket["assignee_id"] == 555
+    assert _assignee_in_puts(client.fake) == 555
+
+
+def test_contact_center_call_makes_one_ticket_assigned_to_answerer(client):
+    # A call ringing through a contact center = an entry-point leg (the queue) +
+    # an operator leg (the agent), each with its own call_id but a shared
+    # entry_point_call_id. It must produce ONE ticket, assigned to the answerer.
+    client.fake.agents = {"alex@bpiteam.com": 99}
+    entry = _event("connected", call_id="ROOT")
+    entry["target"] = {"type": "callcenter", "name": "IT - All Agents"}
+    op = _event("connected", call_id="OP1", entry_point_call_id="ROOT")
+    op["target"] = {"type": "user", "name": "Alex", "email": "alex@bpiteam.com"}
+    post(client, entry)   # queue leg first -> ticket created, unassigned
+    post(client, op)      # agent leg -> same ticket, now assigned
+    assert len(client.fake.posts) == 1
+    assert _assignee_in_puts(client.fake) == 99
+
+
+def test_contact_center_operator_leg_first_still_one_ticket(client):
+    # Same as above but the agent leg arrives first (event ordering isn't fixed).
+    client.fake.agents = {"alex@bpiteam.com": 99}
+    op = _event("connected", call_id="OP1", entry_point_call_id="ROOT")
+    op["target"] = {"type": "user", "name": "Alex", "email": "alex@bpiteam.com"}
+    entry = _event("connected", call_id="ROOT")
+    entry["target"] = {"type": "callcenter", "name": "IT - All Agents"}
+    post(client, op)
+    post(client, entry)
+    assert len(client.fake.posts) == 1
+    assert _assignee_in_puts(client.fake) == 99
 
 
 def test_voicemail_left_unassigned_for_the_group(client):

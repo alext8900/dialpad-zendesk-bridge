@@ -21,9 +21,17 @@ def init():
                    recap_done INTEGER DEFAULT 0,
                    enriched INTEGER DEFAULT 0,
                    vm_link_done INTEGER DEFAULT 0,
-                   vm_transcript_done INTEGER DEFAULT 0
+                   vm_transcript_done INTEGER DEFAULT 0,
+                   assigned INTEGER DEFAULT 0
                )"""
         )
+        # Upgrade older databases: add any columns missing from earlier versions.
+        for col in ("recap_done", "enriched", "vm_link_done",
+                    "vm_transcript_done", "assigned"):
+            try:
+                c.execute(f"ALTER TABLE calls ADD COLUMN {col} INTEGER DEFAULT 0")
+            except sqlite3.OperationalError:
+                pass  # column already exists
 
 
 def get_ticket(call_id: str):
@@ -79,6 +87,19 @@ def vm_transcript_done(call_id: str) -> bool:
 def mark_vm_transcript(call_id: str):
     with _conn() as c:
         c.execute("UPDATE calls SET vm_transcript_done = 1 WHERE call_id = ?", (call_id,))
+
+
+def is_assigned(call_id: str) -> bool:
+    with _conn() as c:
+        row = c.execute(
+            "SELECT assigned FROM calls WHERE call_id = ?", (call_id,)
+        ).fetchone()
+        return bool(row and row[0])
+
+
+def mark_assigned(call_id: str):
+    with _conn() as c:
+        c.execute("UPDATE calls SET assigned = 1 WHERE call_id = ?", (call_id,))
 
 
 def is_enriched(call_id: str) -> bool:

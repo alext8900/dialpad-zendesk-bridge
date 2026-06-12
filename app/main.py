@@ -117,8 +117,13 @@ async def dialpad_webhook(request: Request):
 
     contact = event.get("contact") or {}
     target = event.get("target") or {}
-    log.info("event call_id=%s state=%s direction=%s contact=%s:%s target=%s:%s",
-             call_id, state, direction, contact.get("type"), contact.get("name"),
+    # One real call rings through a contact center as MANY legs, each with its own
+    # call_id. They all share the entry-point call's id, so key everything on that
+    # ("the call graph root") to keep it ONE ticket. Operator/agent legs carry
+    # entry_point_call_id; the entry-point leg has it null and IS the root.
+    key = str(event.get("entry_point_call_id") or call_id)
+    log.info("event call_id=%s key=%s state=%s direction=%s contact=%s:%s target=%s:%s",
+             call_id, key, state, direction, contact.get("type"), contact.get("name"),
              target.get("type"), target.get("name"))
     if DEBUG_PAYLOAD:
         log.info("payload call_id=%s %s", call_id, json.dumps(event, default=str))
@@ -127,7 +132,7 @@ async def dialpad_webhook(request: Request):
     # (AI recap, voicemail recording, voicemail transcription). They no-op
     # unless we already created a ticket for this call, so they're safe to run
     # before the internal-only gate — external calls have no ticket to touch.
-    _attach_extras(call_id, event)
+    _attach_extras(key, event)
 
     if state in CREATE_STATES:
         if TICKET_ON != "both" and direction != TICKET_ON:
@@ -142,21 +147,28 @@ async def dialpad_webhook(request: Request):
             return {"ignored": f"external caller (contact.type={contact_type or 'n/a'}); "
                                "handled by native integration"}
 
-        if store.get_ticket(call_id) is None:
+        if store.get_ticket(key) is None:
             answered = state == "connected"
             voicemail = state in VOICEMAIL_STATES
             ticket_id = _create_ticket(event, answered=answered, voicemail=voicemail)
-            store.save_ticket(call_id, ticket_id)
-            # Attach anything already present on the creating event.
-            _attach_extras(call_id, event)
+            store.save_ticket(key, ticket_id)
+            _attach_extras(key, event)
             # A ticket born from a terminal state already has final duration.
             if state in TERMINAL_STATES:
-                store.mark_enriched(call_id)
+                store.mark_enriched(key)
+            # If THIS leg is the one that answered, assign it now.
+            if state == "connected":
+                _maybe_assign(key, event)
             return {"created": ticket_id, "answered": answered, "voicemail": voicemail}
 
-        # Ticket already exists (created on 'connected'); fill in final details.
+        # Ticket already exists for this call. Later legs still tell us things:
+        # the operator leg that connected = who answered; terminal = final duration.
+        # This is what makes one ticket land on the right agent instead of spawning
+        # a second ticket per leg.
+        if state == "connected":
+            _maybe_assign(key, event)
         if state in TERMINAL_STATES:
-            _maybe_enrich(call_id, event)
+            _maybe_enrich(key, event)
 
     return {"ok": state}
 
@@ -254,6 +266,30 @@ def _assignee_id(event: dict):
     return None
 
 
+def _update_ticket(ticket_id: int, fields: dict):
+    """PUT arbitrary ticket fields (e.g. assignee_id)."""
+    r = httpx.put(f"{ZBASE}/tickets/{ticket_id}.json",
+                  json={"ticket": fields}, auth=ZAUTH, timeout=15)
+    r.raise_for_status()
+
+
+def _maybe_assign(key: str, event: dict):
+    """Assign the call's ONE ticket to the agent who answered (the operator leg
+    whose target is a user). Idempotent — assigns once per call, even though the
+    same logical call rings through several agent legs."""
+    if store.is_assigned(key):
+        return
+    ticket_id = store.get_ticket(key)
+    if not ticket_id:
+        return
+    aid = _assignee_id(event)
+    if not aid:
+        return  # not the agent leg (e.g. the entry-point/queue leg) — wait for it
+    _update_ticket(ticket_id, {"assignee_id": aid})
+    store.mark_assigned(key)
+    log.info("assigned ticket %s to agent %s (call %s)", ticket_id, aid, key)
+
+
 def _comment(ticket_id: int, body: str, uploads=None):
     """Add a private comment to an existing ticket, optionally with file uploads
     (Zendesk upload tokens from _zendesk_upload)."""
@@ -330,12 +366,9 @@ def _create_ticket(event: dict, answered: bool, voicemail: bool = False) -> int:
     rid = _requester_id(event)
     if rid:
         ticket["requester_id"] = rid
-    # Answered calls go to whoever picked up; voicemails/missed stay unassigned
-    # so they fall into the default (Support) group for someone to grab.
-    if answered:
-        aid = _assignee_id(event)
-        if aid:
-            ticket["assignee_id"] = aid
+    # Assignment happens separately via _maybe_assign once we see the operator
+    # leg that actually answered (the creating leg may be the queue, not an agent).
+    # Voicemails/missed stay unassigned -> default (Support) group.
     if DEFAULT_GROUP_ID.isdigit():
         ticket["group_id"] = int(DEFAULT_GROUP_ID)
 
