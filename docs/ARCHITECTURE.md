@@ -128,4 +128,3 @@ whoever finally handled it.
 - ⏳ Open: clear `external_id` on the one pre-fix duplicate contact then merge;
   optional scope/queue rule (payloads are logged on ticketing events for this);
   CI not wired; FastAPI `on_event` → lifespan (cosmetic).
-</content>
