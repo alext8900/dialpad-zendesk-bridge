@@ -45,24 +45,26 @@ internal IT help desk. This bridge subscribes to Dialpad's raw **Call Events**
 3. Expose `:8080` to the internet over HTTPS. Easiest: put it behind the same
    reverse proxy / tunnel you already use, or a Cloudflare Tunnel. Dialpad must
    be able to reach `https://<your-host>/dialpad/webhook`.
-4. Find the target IDs to scope to (one time):
+4. Find the target IDs to scope to (one time). The helper scripts auto-read
+   `.env`, so as long as `DIALPAD_API_TOKEN` is in it:
    ```bash
-   docker compose exec bridge \
-     env DIALPAD_API_TOKEN=... python list_dialpad_targets.py IT
+   docker compose exec bridge python list_dialpad_targets.py IT
    ```
    Note the DEPARTMENT id for the IT Department + the CALLCENTER ids for the 3
-   IT queues.
-5. Register the webhook + subscriptions with Dialpad (one time):
+   IT queues, and put them in `.env` as `IT_TARGETS` plus set `PUBLIC_WEBHOOK_URL`:
+   ```
+   PUBLIC_WEBHOOK_URL=https://<your-host>/dialpad/webhook
+   IT_TARGETS=department:<deptId>,callcenter:<as400>,callcenter:<tech>,callcenter:<allAgents>
+   ```
+5. Register the webhook + subscriptions with Dialpad (one time, reads `.env`):
    ```bash
-   docker compose exec bridge \
-     env DIALPAD_API_TOKEN=... \
-         PUBLIC_WEBHOOK_URL=https://<your-host>/dialpad/webhook \
-         DIALPAD_WEBHOOK_SECRET=<same as .env> \
-         IT_TARGETS="department:<deptId>,callcenter:<as400>,callcenter:<tech>,callcenter:<allAgents>" \
-     python setup_dialpad.py
+   docker compose exec bridge python setup_dialpad.py
    ```
    One subscription is created per target. Dialpad target types: `office`,
    `department`, `callcenter`, `user`, `room`.
+
+> Running the scripts **locally** instead of in the container? Use the venv —
+> `./.venv/bin/python list_dialpad_targets.py IT` — they read the same `.env`.
 
 ## Verify
 - `curl https://<your-host>/healthz` → `{"ok": true}`

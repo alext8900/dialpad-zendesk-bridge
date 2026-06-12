@@ -25,6 +25,10 @@ Dialpad target types: office, department, callcenter, user, room.
 import os
 import httpx
 
+import envfile
+
+envfile.load()  # pick up DIALPAD_API_TOKEN / PUBLIC_WEBHOOK_URL / IT_TARGETS from .env
+
 API = "https://dialpad.com/api/v2"
 TOKEN = os.environ["DIALPAD_API_TOKEN"]
 HOOK_URL = os.environ["PUBLIC_WEBHOOK_URL"]

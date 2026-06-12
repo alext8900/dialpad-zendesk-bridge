@@ -19,6 +19,10 @@ import sys
 
 import httpx
 
+import envfile
+
+envfile.load()  # pick up DIALPAD_API_TOKEN etc. from .env if present
+
 API = "https://dialpad.com/api/v2"
 TOKEN = os.environ["DIALPAD_API_TOKEN"]
 H = {"Authorization": f"Bearer {TOKEN}"}
