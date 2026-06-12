@@ -9,12 +9,15 @@ internal IT help desk. This bridge subscribes to Dialpad's raw **Call Events**
 - Listens for Dialpad call events on `POST /dialpad/webhook`
 - On **connected** (answered): creates the ticket the moment the agent picks up,
   matching the native integration's behavior (deduped by `call_id`)
-- On **hangup / voicemail**: safety net — creates a ticket for calls that never
-  connected (missed / voicemail), tagged `missed-call`, and adds final call
-  duration to the answered-call ticket
-- On **recap_summary**: attaches Dialpad's **AI call recap** (summary + outcome +
-  action items) as a private comment once it's ready (lands *after* the call ends
-  and can lag) — used instead of the call recording
+- On **hangup**: safety net — creates a `missed-call` ticket for calls that rang
+  out, and adds final call duration to the answered-call ticket
+- On **voicemail / voicemail_uploaded**: creates a `voicemail` ticket and attaches
+  the **voicemail recording** (`voicemail_link`) — this is the case the native
+  integration skips for internal calls. The voicemail **transcription** is
+  attached too when the `transcription` event fires (a beat later)
+- On **recap_summary**: for *answered* calls, attaches Dialpad's **AI call recap**
+  (summary + outcome + action items) as a private comment once it's ready (a
+  voicemail has no recap, so it gets the recording/transcript instead)
 - Tries to match the caller to an existing Zendesk end-user by phone
 
 ## Prereqs
@@ -23,8 +26,10 @@ internal IT help desk. This bridge subscribes to Dialpad's raw **Call Events**
 - **Dialpad Ai (recaps) enabled** on the account — that's what produces the
   `recap_summary` the bridge attaches. (No `recordings_export` scope needed,
   since we attach the AI summary rather than the audio.)
-- The **target_id** of your IT help-desk call center (so you only get IT calls,
-  not every internal call at the company)
+- The **IDs** of the Dialpad targets to scope to. Our topology is the IT
+  Department's menu routing to 3 contact centers, so that's 4 targets: the
+  department (after-hours voicemail) + the 3 contact centers (routed calls).
+  Find the IDs with `list_dialpad_targets.py` (below).
 - A Zendesk API token + an agent email
 
 ## Run it
@@ -34,18 +39,24 @@ internal IT help desk. This bridge subscribes to Dialpad's raw **Call Events**
 3. Expose `:8080` to the internet over HTTPS. Easiest: put it behind the same
    reverse proxy / tunnel you already use, or a Cloudflare Tunnel. Dialpad must
    be able to reach `https://<your-host>/dialpad/webhook`.
-4. Register the webhook + subscription with Dialpad (one time):
+4. Find the target IDs to scope to (one time):
+   ```bash
+   docker compose exec bridge \
+     env DIALPAD_API_TOKEN=... python list_dialpad_targets.py IT
+   ```
+   Note the DEPARTMENT id for the IT Department + the CALLCENTER ids for the 3
+   IT queues.
+5. Register the webhook + subscriptions with Dialpad (one time):
    ```bash
    docker compose exec bridge \
      env DIALPAD_API_TOKEN=... \
          PUBLIC_WEBHOOK_URL=https://<your-host>/dialpad/webhook \
          DIALPAD_WEBHOOK_SECRET=<same as .env> \
-         IT_TARGET_TYPE=callcenter \
-         IT_TARGET_ID=<your IT queue id> \
+         IT_TARGETS="department:<deptId>,callcenter:<as400>,callcenter:<tech>,callcenter:<allAgents>" \
      python setup_dialpad.py
    ```
-   Confirm `IT_TARGET_TYPE` against your queue — Dialpad targets include
-   `office`, `department`, `callcenter`, `user`, `room`, etc.
+   One subscription is created per target. Dialpad target types: `office`,
+   `department`, `callcenter`, `user`, `room`.
 
 ## Verify
 - `curl https://<your-host>/healthz` → `{"ok": true}`

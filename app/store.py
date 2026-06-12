@@ -19,7 +19,9 @@ def init():
                    call_id TEXT PRIMARY KEY,
                    ticket_id INTEGER,
                    recap_done INTEGER DEFAULT 0,
-                   enriched INTEGER DEFAULT 0
+                   enriched INTEGER DEFAULT 0,
+                   vm_link_done INTEGER DEFAULT 0,
+                   vm_transcript_done INTEGER DEFAULT 0
                )"""
         )
 
@@ -51,6 +53,32 @@ def recap_done(call_id: str) -> bool:
 def mark_recap(call_id: str):
     with _conn() as c:
         c.execute("UPDATE calls SET recap_done = 1 WHERE call_id = ?", (call_id,))
+
+
+def vm_link_done(call_id: str) -> bool:
+    with _conn() as c:
+        row = c.execute(
+            "SELECT vm_link_done FROM calls WHERE call_id = ?", (call_id,)
+        ).fetchone()
+        return bool(row and row[0])
+
+
+def mark_vm_link(call_id: str):
+    with _conn() as c:
+        c.execute("UPDATE calls SET vm_link_done = 1 WHERE call_id = ?", (call_id,))
+
+
+def vm_transcript_done(call_id: str) -> bool:
+    with _conn() as c:
+        row = c.execute(
+            "SELECT vm_transcript_done FROM calls WHERE call_id = ?", (call_id,)
+        ).fetchone()
+        return bool(row and row[0])
+
+
+def mark_vm_transcript(call_id: str):
+    with _conn() as c:
+        c.execute("UPDATE calls SET vm_transcript_done = 1 WHERE call_id = ?", (call_id,))
 
 
 def is_enriched(call_id: str) -> bool:

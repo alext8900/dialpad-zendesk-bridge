@@ -151,6 +151,30 @@ def test_outbound_call_not_ticketed_by_default(client):
     assert len(client.fake.posts) == 0
 
 
+def test_voicemail_creates_ticket_with_recording_and_transcript(client):
+    # voicemail_uploaded carries the recording link...
+    r = post(client, _event("voicemail_uploaded",
+                            voicemail_link="https://dialpad.com/vm/xyz"))
+    body = r.json()
+    assert body["voicemail"] is True and "created" in body
+    ticket = client.fake.posts[0][1]["json"]["ticket"]
+    assert "voicemail" in ticket["tags"] and "missed-call" in ticket["tags"]
+    assert any("dialpad.com/vm/xyz" in p[1]["json"]["ticket"]["comment"]["body"]
+               for p in client.fake.puts)
+    # ...the transcription lands later on its own event.
+    post(client, _event("transcription",
+                        transcription_text="My laptop won't boot, please call back."))
+    assert any("won't boot" in p[1]["json"]["ticket"]["comment"]["body"]
+               for p in client.fake.puts)
+
+
+def test_voicemail_recording_attached_only_once(client):
+    post(client, _event("voicemail_uploaded", voicemail_link="https://dialpad.com/vm/xyz"))
+    puts = len(client.fake.puts)
+    post(client, _event("voicemail_uploaded", voicemail_link="https://dialpad.com/vm/xyz"))
+    assert len(client.fake.puts) == puts  # no duplicate recording comment
+
+
 def test_external_caller_is_skipped(client):
     # contact.type != "user" => external; native integration handles it.
     ev = _event("connected")
