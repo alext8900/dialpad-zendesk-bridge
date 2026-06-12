@@ -229,7 +229,22 @@ def test_contact_center_assigns_via_operator_fetch(client, monkeypatch):
     post(client, _cc_answer())
     assert len(client.fake.posts) == 1
     assert _assignees(client.fake)[-1] == 99
-    assert "Alex Thompson" in _subject_of(client.fake)
+    ticket = client.fake.posts[0][1]["json"]["ticket"]
+    # subject is agent-only: no queue prefix, no "(Don't call)"
+    assert ticket["subject"] == "Dialpad call with Jane Tech — answered by Alex Thompson"
+    # call center goes in a tag (cleaned + slugged)
+    assert "it_as400" in ticket["tags"]
+
+
+def test_call_center_tag_and_dontcall_stripping(client):
+    assert main._strip_dontcall("IT - AS400 (Don't Call)") == "IT - AS400"
+    assert main._strip_dontcall("IT - Technical Support (Don't call)") == "IT - Technical Support"
+    ev = _cc_answer()
+    ev["target"] = {"type": "call_center", "name": "IT - Technical Support (Don't call)"}
+    post(client, ev)
+    tags = client.fake.posts[0][1]["json"]["ticket"]["tags"]
+    assert "it_technical_support" in tags
+    assert all("(don't" not in t.lower() for t in tags)
 
 
 def test_last_answerer_owns_on_transfer(client, monkeypatch):

@@ -22,8 +22,10 @@ internal IT help desk. This bridge subscribes to Dialpad's raw **Call Events**
   is a separate operator leg, fetched via `operator_call_id` (Dialpad `GET
   /api/v2/call/{id}`). No match → unassigned in the default (Support) group.
 - **Subject**: `Dialpad call with {caller} — answered by {agent} · {length}` for
-  answered calls (length from `talk_time`), `Dialpad voicemail from {caller}` for
-  voicemails. The first comment is a clean Caller / Receiver breakdown.
+  answered calls (just the agent, not the queue), `Dialpad voicemail from {caller}`
+  for voicemails. The **call center is added as a tag** (slugged, e.g.
+  `it_technical_support`), like the native integration. The `(Don't Call)` marker
+  on the IT call-center names is stripped from the subject, body, and tag.
 - On **voicemail / voicemail_uploaded**: creates a `voicemail` ticket and attaches
   the **voicemail recording as an actual audio file** (downloaded from Dialpad and
   re-uploaded to Zendesk, like the native integration) — this is the case the

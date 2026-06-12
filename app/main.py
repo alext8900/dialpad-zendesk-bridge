@@ -424,14 +424,33 @@ def _caller_name(event: dict) -> str:
     return c.get("name") or c.get("phone") or "Unknown caller"
 
 
+def _strip_dontcall(name: str) -> str:
+    """Drop the '(Don't Call)' marker BPI adds to IT call-center names."""
+    return re.sub(r"\s*\(don'?t\s+call\)", "", name or "", flags=re.I).strip()
+
+
+def _call_center_name(event: dict):
+    """The call center / department the call landed in (cleaned), or None for a
+    direct user-to-user call."""
+    target = event.get("target") or {}
+    if (target.get("type") or "").lower() in ("call_center", "callcenter", "department"):
+        return _strip_dontcall(target.get("name")) or None
+    return None
+
+
+def _cc_tag(event: dict):
+    """Slug the call-center name into a Zendesk tag, e.g. 'it_technical_support'."""
+    cc = _call_center_name(event)
+    if not cc:
+        return None
+    slug = re.sub(r"[^a-z0-9]+", "_", cc.lower()).strip("_")
+    return slug or None
+
+
 def _receiver_name(event: dict, agent: dict = None) -> str:
-    """Who took it: the resolved agent if we have one, else the queue/target name,
-    prefixed with the queue when both are known ('IT - AS400 / Alex Thompson')."""
-    queue = (event.get("target") or {}).get("name")
-    agent_name = (agent or {}).get("name")
-    if agent_name and queue and queue != agent_name:
-        return f"{queue} / {agent_name}"
-    return agent_name or queue or "IT"
+    """Who took it: the resolved agent if we have one, else the (cleaned) target."""
+    return (agent or {}).get("name") or _strip_dontcall(
+        (event.get("target") or {}).get("name")) or "IT"
 
 
 def _subject(event: dict, answered: bool, voicemail: bool,
@@ -462,6 +481,9 @@ def _render_body(event: dict, answered: bool, voicemail: bool,
         lines.append(f"Email: {recv_email}")
     if target.get("phone"):
         lines.append(f"Phone: {target['phone']}")
+    cc = _call_center_name(event)
+    if cc:
+        lines.append(f"Call center: {cc}")
     if voicemail:
         lines += ["", "(voicemail recording & transcription attached below)"]
     lines += ["", f"Dialpad call id: {event.get('call_id')}"]
@@ -476,6 +498,9 @@ def _create_ticket(event: dict, answered: bool, voicemail: bool = False,
     tags = ["dialpad", "internal-call"]
     if voicemail:
         tags += ["voicemail", "missed-call"]
+    cc_tag = _cc_tag(event)
+    if cc_tag:
+        tags.append(cc_tag)
 
     ticket = {
         "subject": subject,
