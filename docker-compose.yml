@@ -2,13 +2,23 @@ services:
   bridge:
     build: .
     restart: unless-stopped
+    # No host port published on purpose: the public path is the Cloudflare Tunnel
+    # (cloudflared reaches the bridge at bridge:8080 over the internal network),
+    # so nothing needs to bind a host port. This also sidesteps Windows reserving
+    # ports like 8080 (WinNAT/Hyper-V). To expose it locally anyway, add e.g.
+    #   ports: ["18080:8080"]   # pick a port not in `netsh int ipv4 show excludedportrange protocol=tcp`
     expose:
       - "8080"              # reachable to cloudflared on the internal network
-    ports:
-      - "127.0.0.1:8080:8080"  # local-only, for `curl localhost:8080/healthz`
     env_file: .env
     volumes:
       - ./data:/data        # SQLite state survives restarts
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8080/healthz').status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
 
   # Cloudflare Tunnel -> publishes the bridge at dialpad.bpiteam.com with a
   # stable URL and no inbound firewall ports. Create the tunnel in the Cloudflare

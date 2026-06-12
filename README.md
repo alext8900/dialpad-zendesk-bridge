@@ -84,8 +84,11 @@ public hostname with no inbound firewall ports. One-time dashboard setup:
 `bpiteam.com` must be a zone in this Cloudflare account for the hostname to route.
 
 ## Verify
-- `curl https://dialpad.bpiteam.com/healthz` → `{"ok": true}` (and
-  `curl http://localhost:8080/healthz` on the box itself)
+- `docker compose ps` → the `bridge` container should be **healthy** (internal
+  healthcheck; no host port is published — the tunnel is the access path).
+- `curl https://dialpad.bpiteam.com/healthz` → `{"ok": true}`. To check from the
+  box without the tunnel: `docker compose exec bridge python -c "import
+  urllib.request; print(urllib.request.urlopen('http://localhost:8080/healthz').read())"`.
 - `docker compose logs -f cloudflared` should show a registered connection.
 - Place a test internal call into the IT queue, hang up, watch the logs:
   `docker compose logs -f bridge`. A ticket should appear; the AI recap comment
