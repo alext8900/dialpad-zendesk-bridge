@@ -200,4 +200,3 @@ else plain JSON), then:
   Dialpad/Zendesk — say so when something needs real-event verification.
 - Pushing to `main` is the deploy path (server pulls). Don't touch Cloudflare /
   Railway / Fly infra directly; give the user the steps.
-</content>
