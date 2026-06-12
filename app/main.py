@@ -42,6 +42,17 @@ DEFAULT_GROUP_ID = os.environ.get("ZENDESK_GROUP_ID")
 # 'hangup' here if you DON'T want tickets for abandoned calls with no voicemail.
 CREATE_STATES = {"connected", "hangup", "voicemail"}
 TERMINAL_STATES = {"hangup", "voicemail"}
+# Only ticket INTERNAL (Dialpad-to-Dialpad) calls. External callers are already
+# ticketed by Dialpad's native Zendesk integration, so handling them here too
+# would double up. An internal caller has contact.type == "user"; external
+# callers are local/google/nylas/microsoft. Override the type set if your tenant
+# differs (e.g. include 'room'); set INTERNAL_ONLY=false to ticket everything.
+INTERNAL_ONLY = os.environ.get("INTERNAL_ONLY", "true").lower() == "true"
+INTERNAL_CONTACT_TYPES = {
+    t.strip().lower()
+    for t in os.environ.get("INTERNAL_CONTACT_TYPES", "user").split(",")
+    if t.strip()
+}
 
 ZBASE = f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/api/v2"
 ZAUTH = (f"{ZENDESK_EMAIL}/token", ZENDESK_API_TOKEN)
@@ -82,6 +93,13 @@ async def dialpad_webhook(request: Request):
         return {"ignored": "no call_id/state"}
 
     log.info("event call_id=%s state=%s direction=%s", call_id, state, direction)
+
+    # Skip external callers — the native Dialpad-Zendesk integration already
+    # tickets those, so handling them here would create a duplicate ticket.
+    contact_type = ((event.get("contact") or {}).get("type") or "").lower()
+    if INTERNAL_ONLY and contact_type not in INTERNAL_CONTACT_TYPES:
+        return {"ignored": f"external caller (contact.type={contact_type or 'n/a'}); "
+                           "handled by native integration"}
 
     # the AI recap summary arrives on its own event after the call ends
     if event.get("recap_summary"):

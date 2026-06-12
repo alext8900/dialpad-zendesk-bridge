@@ -54,6 +54,12 @@ internal IT help desk. This bridge subscribes to Dialpad's raw **Call Events**
   follows once Dialpad finishes generating it.
 
 ## Knobs
+- `INTERNAL_ONLY` = `true` (default) — only tickets **internal** calls so it stays
+  purely supplemental to the native integration (which already tickets external
+  calls). Internal callers have `contact.type == "user"`; external callers are
+  `local`/`google`/`nylas`/`microsoft`. Set `false` to ticket every call.
+- `INTERNAL_CONTACT_TYPES` = `user` (default) — comma-list of `contact.type`
+  values treated as internal (e.g. `user,room`) if your tenant differs.
 - `TICKET_ON` = `inbound` (default) | `outbound` | `both`
 - `ZENDESK_GROUP_ID` — route auto-tickets straight to the IT group
 - `CREATE_STATES` in `app/main.py` controls ticket timing. Default creates on

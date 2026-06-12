@@ -84,7 +84,7 @@ def _event(state, call_id="call-1", direction="inbound", **extra):
         "call_id": call_id,
         "state": state,
         "direction": direction,
-        "contact": {"name": "Jane Tech", "phone": "+15551112222"},
+        "contact": {"name": "Jane Tech", "phone": "+15551112222", "type": "user"},
         "target": {"name": "IT Help Desk"},
     }
     ev.update(extra)
@@ -148,6 +148,15 @@ def test_recap_attached_only_once(client):
 def test_outbound_call_not_ticketed_by_default(client):
     r = post(client, _event("connected", direction="outbound"))
     assert "ignored" in r.json()
+    assert len(client.fake.posts) == 0
+
+
+def test_external_caller_is_skipped(client):
+    # contact.type != "user" => external; native integration handles it.
+    ev = _event("connected")
+    ev["contact"] = {"name": "Acme Corp", "phone": "+18005550000", "type": "google"}
+    r = post(client, ev)
+    assert "ignored" in r.json() and "external" in r.json()["ignored"]
     assert len(client.fake.posts) == 0
 
 
