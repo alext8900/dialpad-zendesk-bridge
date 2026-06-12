@@ -41,10 +41,9 @@ internal IT help desk. This bridge subscribes to Dialpad's raw **Call Events**
 1. `cp .env.example .env` and fill in the Zendesk values, a long random
    `DIALPAD_WEBHOOK_SECRET`, and `DIALPAD_API_TOKEN` (needed to attach voicemail
    audio files).
-2. `docker compose up -d --build`
-3. Expose `:8080` to the internet over HTTPS. Easiest: put it behind the same
-   reverse proxy / tunnel you already use, or a Cloudflare Tunnel. Dialpad must
-   be able to reach `https://<your-host>/dialpad/webhook`.
+2. Set up the public URL (Cloudflare Tunnel) — see **Public URL** below — and put
+   its `TUNNEL_TOKEN` + `PUBLIC_WEBHOOK_URL` in `.env`.
+3. `docker compose up -d --build` (starts both the bridge and the tunnel).
 4. Find the target IDs to scope to (one time). The helper scripts auto-read
    `.env`, so as long as `DIALPAD_API_TOKEN` is in it:
    ```bash
@@ -66,8 +65,28 @@ internal IT help desk. This bridge subscribes to Dialpad's raw **Call Events**
 > Running the scripts **locally** instead of in the container? Use the venv —
 > `./.venv/bin/python list_dialpad_targets.py IT` — they read the same `.env`.
 
+## Public URL (Cloudflare Tunnel)
+The `cloudflared` service in `docker-compose.yml` publishes the bridge at a stable
+public hostname with no inbound firewall ports. One-time dashboard setup:
+
+1. Cloudflare **Zero Trust** → **Networks → Tunnels → Create a tunnel** →
+   type **Cloudflared** → name it (e.g. `dialpad-bridge`) → **Save**.
+2. On the "Install connector" screen, copy the **token** (the long string after
+   `--token` in the shown command). Put it in `.env` as `TUNNEL_TOKEN=...`.
+   (You do NOT run the install command — the compose `cloudflared` service does.)
+3. **Public Hostname** tab → **Add a public hostname**:
+   - Subdomain `dialpad`, Domain `bpiteam.com`  →  `https://dialpad.bpiteam.com`
+   - Service: **Type** `HTTP`, **URL** `bridge:8080`
+     (cloudflared reaches the bridge by its compose service name on the internal
+     network — not `localhost`).
+4. `docker compose up -d` — the tunnel connects and `dialpad.bpiteam.com` goes live.
+
+`bpiteam.com` must be a zone in this Cloudflare account for the hostname to route.
+
 ## Verify
-- `curl https://<your-host>/healthz` → `{"ok": true}`
+- `curl https://dialpad.bpiteam.com/healthz` → `{"ok": true}` (and
+  `curl http://localhost:8080/healthz` on the box itself)
+- `docker compose logs -f cloudflared` should show a registered connection.
 - Place a test internal call into the IT queue, hang up, watch the logs:
   `docker compose logs -f bridge`. A ticket should appear; the AI recap comment
   follows once Dialpad finishes generating it.

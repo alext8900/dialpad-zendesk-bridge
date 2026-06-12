@@ -2,8 +2,21 @@ services:
   bridge:
     build: .
     restart: unless-stopped
+    expose:
+      - "8080"              # reachable to cloudflared on the internal network
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"  # local-only, for `curl localhost:8080/healthz`
     env_file: .env
     volumes:
       - ./data:/data        # SQLite state survives restarts
+
+  # Cloudflare Tunnel -> publishes the bridge at dialpad.bpiteam.com with a
+  # stable URL and no inbound firewall ports. Create the tunnel in the Cloudflare
+  # Zero Trust dashboard, point its public hostname at http://bridge:8080, and
+  # put its token in .env as TUNNEL_TOKEN. See README "Public URL".
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run --token ${TUNNEL_TOKEN}
+    depends_on:
+      - bridge
