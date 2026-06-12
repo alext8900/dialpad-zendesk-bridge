@@ -27,6 +27,9 @@ services:
   cloudflared:
     image: cloudflare/cloudflared:latest
     restart: unless-stopped
-    command: tunnel --no-autoupdate run --token ${TUNNEL_TOKEN}
+    # Force HTTP/2 over TCP instead of the default QUIC. In Docker (esp. on
+    # Windows/WSL2) the UDP receive buffer is too small for QUIC, which drops
+    # packets and causes intermittent 502s. HTTP/2 is reliable here.
+    command: tunnel --no-autoupdate run --protocol http2 --token ${TUNNEL_TOKEN}
     depends_on:
       - bridge
