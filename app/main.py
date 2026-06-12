@@ -57,16 +57,14 @@ DEFAULT_GROUP_ID = _cfg("ZENDESK_GROUP_ID")             # numeric string or "" (
 # back to dropping the voicemail_link as a comment.
 DIALPAD_API_TOKEN = _cfg("DIALPAD_API_TOKEN")
 ATTACH_VOICEMAIL_AUDIO = _cfg("ATTACH_VOICEMAIL_AUDIO", "true").lower() == "true"
-# Set true to log the full Dialpad event payload (for diagnosing field names).
+# Set true to log the full Dialpad event payload for EVERY event (verbose). The
+# full payload is always logged on ticketing events regardless, for inspection.
 DEBUG_PAYLOAD = _cfg("DEBUG_PAYLOAD", "false").lower() == "true"
-# Minimum agent TALK time (seconds) for an answered call to make a ticket. We use
-# talk_time (real agent conversation, excluding IVR/queue/ring) so menu-disconnects
-# (talk_time 0) and pocket-dials are filtered. 0 = ticket any call with real talk.
-MIN_TALK_SECONDS = int(_cfg("MIN_TALK_SECONDS", "0") or 0)
-# States the bridge acts on for ticket CREATION. We create at hangup (talk_time is
-# only known then) for answered calls, and on voicemail_uploaded for voicemails.
+# States the bridge acts on. Two-phase: create on 'connected' the moment an agent
+# answers; finalize (append length) on 'hangup'. hangup also creates as a fallback
+# if the connected was missed. Voicemails create on voicemail_uploaded.
 VOICEMAIL_STATES = {"voicemail", "voicemail_uploaded"}
-CREATE_STATES = {"hangup", "voicemail", "voicemail_uploaded"}
+CREATE_STATES = {"connected", "hangup", "voicemail", "voicemail_uploaded"}
 # Only ticket INTERNAL (Dialpad-to-Dialpad) calls. External callers are already
 # ticketed by Dialpad's native Zendesk integration, so handling them here too
 # would double up. An internal caller has contact.type == "user"; external
@@ -150,27 +148,88 @@ async def dialpad_webhook(request: Request):
             return {"ignored": f"external caller (contact.type={contact_type or 'n/a'}); "
                                "handled by native integration"}
 
-        # Ticket when an agent actually TALKED (talk_time, set at hangup, excludes
-        # IVR/queue/ring time) or a VOICEMAIL was left. Menu-disconnects, abandons,
-        # and transfer hops have talk_time 0 -> filtered out.
+        existing = store.get_ticket(key)
         voicemail = state in VOICEMAIL_STATES
-        answered = state == "hangup" and talk_secs > 0 and talk_secs >= MIN_TALK_SECONDS
+        # "Answered" = an agent actually picked up. A contact-center answer sets
+        # operator_call_id + date_connected; a direct answer is target.type==user
+        # + date_connected. Menu-disconnects / ring-outs set none of these, so they
+        # never ticket. (No talk_time threshold — answered-then-instantly-dropped
+        # is treated as a real interaction.)
+        answered = bool(event.get("date_connected")) and (
+            bool(event.get("operator_call_id")) or contact_type_is_agent(target))
 
-        if store.get_ticket(key) is not None:
-            return {"ok": "deduped"}  # another leg of a call we already ticketed
-        if not (answered or voicemail):
-            return {"ignored": f"not ticketed (talk={talk_secs}s, state={state})"}
+        # ---- Voicemail: create on voicemail_uploaded -----------------------
+        if voicemail:
+            if existing is not None:
+                return {"ok": "deduped"}
+            _log_ticketing("voicemail", event)
+            tid, subject = _create_ticket(event, answered=False, voicemail=True)
+            store.save_ticket(key, tid, subject)
+            store.mark_enriched(key)            # no call length for a voicemail
+            _attach_extras(key, event)
+            return {"created": tid, "voicemail": True}
 
-        agent = _resolve_agent(event) if answered else None
-        ticket_id, subject = _create_ticket(event, answered=answered, voicemail=voicemail,
-                                            agent=agent, talk_secs=talk_secs)
-        store.save_ticket(key, ticket_id, subject)
-        _attach_extras(key, event)
-        if agent:
-            _assign(key, ticket_id, agent)
-        return {"created": ticket_id, "answered": answered, "voicemail": voicemail}
+        # ---- Phase 1: agent answered (connected) ---------------------------
+        if state == "connected":
+            if not answered:
+                return {"ignored": "connected but no agent answer (menu/queue)"}
+            _log_ticketing("connected", event)
+            agent = _resolve_agent(event)
+            if existing is None:
+                tid, subject = _create_ticket(event, answered=True, agent=agent)
+                store.save_ticket(key, tid, subject)
+                _attach_extras(key, event)
+                if agent:
+                    _assign(key, tid, agent)
+                return {"created": tid, "answered": True}
+            # Already ticketed — reassign to whoever just answered (last owns).
+            if agent:
+                _assign(key, existing, agent)
+            return {"ok": "reassigned"}
+
+        # ---- Phase 2: hangup -> finalize length, or fallback create --------
+        if state == "hangup":
+            if existing is not None:
+                _append_length(key, existing, event)
+                return {"ok": "finalized"}
+            if not answered:
+                return {"ignored": "unanswered hangup (menu/ring-out)"}
+            _log_ticketing("hangup-fallback", event)   # connected was missed
+            agent = _resolve_agent(event)
+            tid, subject = _create_ticket(event, answered=True, agent=agent,
+                                          talk_secs=talk_secs)
+            store.save_ticket(key, tid, subject)
+            store.mark_enriched(key)            # length already baked in at create
+            _attach_extras(key, event)
+            if agent:
+                _assign(key, tid, agent)
+            return {"created": tid, "answered": True}
 
     return {"ok": state}
+
+
+def contact_type_is_agent(target: dict) -> bool:
+    return (target.get("type") or "").lower() == "user"
+
+
+def _log_ticketing(reason: str, event: dict):
+    """Full payload on ticketing events, so we can inspect fields for a future
+    scope/queue rule (routing_breadcrumbs, transferred_from, group_id, etc.)."""
+    log.info("ticketing[%s] call_id=%s %s", reason, event.get("call_id"),
+             json.dumps(event, default=str))
+
+
+def _append_length(key: str, ticket_id: int, event: dict):
+    """Phase 2: append the call length to the subject once, on hangup."""
+    if store.is_enriched(key):
+        return
+    base = store.get_subject(key)
+    secs = round((event.get("talk_time") or event.get("duration") or 0) / 1000)
+    if base and secs:
+        _update_ticket(ticket_id, {"subject": f"{base} · {_fmt_duration(secs * 1000)}"})
+        log.info("appended length to ticket %s (call %s): %s",
+                 ticket_id, key, _fmt_duration(secs * 1000))
+    store.mark_enriched(key)
 
 
 def _attach_extras(call_id: str, event: dict):
