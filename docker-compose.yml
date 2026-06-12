@@ -31,5 +31,9 @@ services:
     # Windows/WSL2) the UDP receive buffer is too small for QUIC, which drops
     # packets and causes intermittent 502s. HTTP/2 is reliable here.
     command: tunnel --no-autoupdate run --protocol http2 --token ${TUNNEL_TOKEN}
+    # Wait until the bridge is HEALTHY before starting, so its service-name DNS
+    # entry exists on the network first (avoids "lookup bridge: no such host"
+    # when cloudflared starts/recreates ahead of the bridge).
     depends_on:
-      - bridge
+      bridge:
+        condition: service_healthy
