@@ -18,7 +18,7 @@ def init():
             """CREATE TABLE IF NOT EXISTS calls (
                    call_id TEXT PRIMARY KEY,
                    ticket_id INTEGER,
-                   recording_done INTEGER DEFAULT 0,
+                   recap_done INTEGER DEFAULT 0,
                    enriched INTEGER DEFAULT 0
                )"""
         )
@@ -40,17 +40,17 @@ def save_ticket(call_id: str, ticket_id: int):
         )
 
 
-def recording_done(call_id: str) -> bool:
+def recap_done(call_id: str) -> bool:
     with _conn() as c:
         row = c.execute(
-            "SELECT recording_done FROM calls WHERE call_id = ?", (call_id,)
+            "SELECT recap_done FROM calls WHERE call_id = ?", (call_id,)
         ).fetchone()
         return bool(row and row[0])
 
 
-def mark_recording(call_id: str):
+def mark_recap(call_id: str):
     with _conn() as c:
-        c.execute("UPDATE calls SET recording_done = 1 WHERE call_id = ?", (call_id,))
+        c.execute("UPDATE calls SET recap_done = 1 WHERE call_id = ?", (call_id,))
 
 
 def is_enriched(call_id: str) -> bool:

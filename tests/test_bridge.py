@@ -127,18 +127,21 @@ def test_missed_call_creates_ticket_tagged_missed(client):
     assert "missed-call" in ticket["tags"]
 
 
-def test_recording_event_attaches_link(client):
+def test_recap_event_attaches_summary(client):
     post(client, _event("connected"))
-    post(client, _event("recording", recording_url=["https://dialpad.com/r/abc"]))
-    assert any("dialpad.com/r/abc" in p[1]["json"]["ticket"]["comment"]["body"]
-               for p in client.fake.puts)
+    post(client, _event("recap_summary",
+                         recap_summary="Caller couldn't reach the VPN; reset their token.",
+                         recap_action_items=["Follow up on VPN cert rotation"]))
+    bodies = [p[1]["json"]["ticket"]["comment"]["body"] for p in client.fake.puts]
+    assert any("couldn't reach the VPN" in b for b in bodies)
+    assert any("Follow up on VPN cert rotation" in b for b in bodies)
 
 
-def test_recording_attached_only_once(client):
+def test_recap_attached_only_once(client):
     post(client, _event("connected"))
-    post(client, _event("recording", recording_url=["https://dialpad.com/r/abc"]))
+    post(client, _event("recap_summary", recap_summary="summary text"))
     puts_after_first = len(client.fake.puts)
-    post(client, _event("recording", recording_url=["https://dialpad.com/r/abc"]))
+    post(client, _event("recap_summary", recap_summary="summary text"))
     assert len(client.fake.puts) == puts_after_first  # no duplicate attach
 
 

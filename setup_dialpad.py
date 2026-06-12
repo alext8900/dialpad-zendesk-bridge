@@ -38,11 +38,12 @@ def main():
     print("webhook_id:", webhook_id)
 
     # 2) create the call-event subscription, scoped to the IT queue.
-    #    We only need hangup (create) and recording (attach) states.
+    #    connected/hangup/voicemail drive ticket creation; recap_summary
+    #    carries the AI summary that gets attached after the call ends.
     sub = {
         "webhook_id": webhook_id,
         "enabled": True,
-        "call_states": ["connected", "hangup", "voicemail", "recording"],
+        "call_states": ["connected", "hangup", "voicemail", "recap_summary"],
     }
     if TARGET_TYPE and TARGET_ID:
         sub["target_type"] = TARGET_TYPE

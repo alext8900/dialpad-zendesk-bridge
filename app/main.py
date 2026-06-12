@@ -83,9 +83,9 @@ async def dialpad_webhook(request: Request):
 
     log.info("event call_id=%s state=%s direction=%s", call_id, state, direction)
 
-    # recording can show up on its own event after the call ends
-    if event.get("recording_url"):
-        _maybe_attach_recording(call_id, event)
+    # the AI recap summary arrives on its own event after the call ends
+    if event.get("recap_summary"):
+        _maybe_attach_recap(call_id, event)
 
     if state in CREATE_STATES:
         if TICKET_ON != "both" and direction != TICKET_ON:
@@ -95,8 +95,8 @@ async def dialpad_webhook(request: Request):
             answered = state == "connected"
             ticket_id = _create_ticket(event, answered=answered)
             store.save_ticket(call_id, ticket_id)
-            if event.get("recording_url"):
-                _maybe_attach_recording(call_id, event)
+            if event.get("recap_summary"):
+                _maybe_attach_recap(call_id, event)
             # A ticket born from a terminal state already has final duration.
             if state in TERMINAL_STATES:
                 store.mark_enriched(call_id)
@@ -182,22 +182,30 @@ def _maybe_enrich(call_id: str, event: dict):
     log.info("enriched ticket %s (call %s)", ticket_id, call_id)
 
 
-def _maybe_attach_recording(call_id: str, event: dict):
+def _maybe_attach_recap(call_id: str, event: dict):
+    """Attach Dialpad's AI recap (summary + outcome + action items) to the ticket.
+    The recap lands on its own event after the call ends and can lag, so it's a
+    second-phase update keyed on call_id — same pattern the recording used, but
+    recaps need no recordings_export scope. Requires Dialpad Ai to be enabled."""
     ticket_id = store.get_ticket(call_id)
-    if not ticket_id or store.recording_done(call_id):
+    if not ticket_id or store.recap_done(call_id):
         return
-    urls = event.get("recording_url") or []
-    if isinstance(urls, str):
-        urls = [urls]
-    if not urls:
+    summary = (event.get("recap_summary") or "").strip()
+    if not summary:
         return
-    # Least-resistance: link(s) in a private comment. To attach the actual audio,
-    # download each URL with your Dialpad bearer token and push it through
-    # Zendesk's Uploads API, then reference the upload token here.
-    body = "Call recording(s):\n" + "\n".join(urls)
+    lines = ["AI call recap (Dialpad):", "", summary]
+    outcome = event.get("recap_outcome")
+    if outcome:
+        lines += ["", f"Outcome: {outcome}"]
+    actions = event.get("recap_action_items") or []
+    if isinstance(actions, str):
+        actions = [actions]
+    if actions:
+        lines += ["", "Action items:"] + [f"- {a}" for a in actions]
+    body = "\n".join(lines)
     r = httpx.put(f"{ZBASE}/tickets/{ticket_id}.json",
                   json={"ticket": {"comment": {"body": body, "public": False}}},
                   auth=ZAUTH, timeout=15)
     r.raise_for_status()
-    store.mark_recording(call_id)
-    log.info("attached recording to ticket %s (call %s)", ticket_id, call_id)
+    store.mark_recap(call_id)
+    log.info("attached AI recap to ticket %s (call %s)", ticket_id, call_id)

@@ -12,13 +12,17 @@ internal IT help desk. This bridge subscribes to Dialpad's raw **Call Events**
 - On **hangup / voicemail**: safety net — creates a ticket for calls that never
   connected (missed / voicemail), tagged `missed-call`, and adds final call
   duration to the answered-call ticket
-- On **recording**: attaches the recording link once it's ready (lands *after*
-  the call ends and sometimes lags)
+- On **recap_summary**: attaches Dialpad's **AI call recap** (summary + outcome +
+  action items) as a private comment once it's ready (lands *after* the call ends
+  and can lag) — used instead of the call recording
 - Tries to match the caller to an existing Zendesk end-user by phone
 
 ## Prereqs
-- A Dialpad **admin/company API key** with the `recordings_export` scope
-  (needed for `recording_url` in events)
+- A Dialpad **admin/company API key** (the bridge uses it to register the webhook
+  + subscription via `setup_dialpad.py`)
+- **Dialpad Ai (recaps) enabled** on the account — that's what produces the
+  `recap_summary` the bridge attaches. (No `recordings_export` scope needed,
+  since we attach the AI summary rather than the audio.)
 - The **target_id** of your IT help-desk call center (so you only get IT calls,
   not every internal call at the company)
 - A Zendesk API token + an agent email
@@ -46,8 +50,8 @@ internal IT help desk. This bridge subscribes to Dialpad's raw **Call Events**
 ## Verify
 - `curl https://<your-host>/healthz` → `{"ok": true}`
 - Place a test internal call into the IT queue, hang up, watch the logs:
-  `docker compose logs -f bridge`. A ticket should appear; the recording comment
-  follows a beat later.
+  `docker compose logs -f bridge`. A ticket should appear; the AI recap comment
+  follows once Dialpad finishes generating it.
 
 ## Knobs
 - `TICKET_ON` = `inbound` (default) | `outbound` | `both`
@@ -61,20 +65,24 @@ internal IT help desk. This bridge subscribes to Dialpad's raw **Call Events**
 
 ## Tests
 The state machine (ticket-on-answer, dedup, missed-call safety net, enrichment,
-recording attach) is covered with mocked HTTP — no network or real creds needed:
+AI recap attach) is covered with mocked HTTP — no network or real creds needed:
 ```bash
 python -m venv .venv && ./.venv/bin/pip install -r requirements-dev.txt
 ./.venv/bin/python -m pytest -q
 ```
 
-## If recordings don't attach
-Dialpad's recording event is known to occasionally lag or no-show even with the
-scope set. The ticket still gets created on hangup — only the recording comment
-is missing. If it's chronic, switch from event-driven recording to fetching the
-recording by `call_id` on a short delay after hangup.
+## If the AI recap doesn't attach
+The `recap_summary` event lands after the call ends and can lag (or won't fire if
+Dialpad Ai isn't enabled / the call wasn't long enough to summarize). The ticket
+is still created on connect/hangup — only the recap comment is missing. If it's
+chronic, switch from event-driven recap to fetching it by `call_id` on a short
+delay after hangup.
 
-## Going from link → real attachment
-`_maybe_attach_recording` drops the Dialpad recording URL as a private comment.
-To attach the actual audio: download each `recording_url` with your Dialpad
-bearer token, push the bytes through Zendesk's Uploads API, then reference the
-returned upload token in the ticket comment.
+## Want the recording too (or instead)?
+The bridge attaches the AI recap, not the audio. To add the recording: the call
+event carries `recording_details[]` (objects with a `url`) plus `was_recorded`
+when the API key has the `recordings_export` scope. Add a `recording` state to
+the subscription and a handler that drops those URLs in a comment — or download
+each `url` with your Dialpad bearer token and push it through Zendesk's Uploads
+API for a real audio attachment. (Note: the field is `recording_details[].url`,
+not `recording_url`.)
