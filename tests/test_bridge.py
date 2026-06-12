@@ -10,6 +10,7 @@ Run:  python -m pytest -q   (after pip install -r requirements-dev.txt)
 
 import importlib
 import os
+import re
 
 import pytest
 
@@ -39,21 +40,26 @@ class FakeResp:
 
 
 class FakeHttpx:
-    """Records every call and returns canned responses.
+    """Records calls and returns canned responses. `posts` holds ONLY ticket
+    creates; user-creates and uploads are tracked separately so ticket-count
+    assertions stay clean.
 
-    - GET  .../users/search.json  -> no matching end-user (skip requester)
+    - GET  .../users/search.json   -> agent (by email) / customer (by phone) / none
     - GET  dialpad secureblob link -> fake audio bytes
-    - POST .../tickets.json       -> a new ticket with an incrementing id
-    - POST .../uploads.json       -> a fake upload token
-    - PUT  .../tickets/{id}.json  -> the enrich / recap / voicemail updates
+    - POST .../tickets.json        -> a new ticket with an incrementing id
+    - POST .../users/create_or_update.json -> a new customer
+    - POST .../uploads.json        -> a fake upload token
+    - PUT  .../tickets/{id}.json   -> the enrich / recap / voicemail updates
     """
 
     def __init__(self):
-        self.posts = []
+        self.posts = []          # ticket creates only
         self.puts = []
         self.gets = []
         self.uploads = []
-        self.agents = {}   # email -> zendesk agent id (for assignee lookup)
+        self.created_users = []   # [{"id":..., "payload":...}]
+        self.agents = {}          # email -> zendesk agent id (assignee lookup)
+        self.users_by_phone = {}  # normalized phone -> {"id":..., "phone":...}
         self._next_id = 100
 
     def get(self, url, **kwargs):
@@ -62,16 +68,25 @@ class FakeHttpx:
             q = (kwargs.get("params") or {}).get("query", "")
             if q in self.agents:
                 return FakeResp({"users": [{"id": self.agents[q], "role": "agent"}]})
+            norm = re.sub(r"\D", "", q)[-10:]
+            if norm and norm in self.users_by_phone:
+                return FakeResp({"users": [self.users_by_phone[norm]]})
             return FakeResp({"users": []})
         # voicemail audio download
         return FakeResp(content=b"FAKE-AUDIO-BYTES",
                         headers={"content-type": "audio/mpeg"})
 
     def post(self, url, **kwargs):
-        self.posts.append((url, kwargs))
         if "uploads.json" in url:
             self.uploads.append((url, kwargs))
             return FakeResp({"upload": {"token": f"uptoken-{len(self.uploads)}"}})
+        if "users/create_or_update.json" in url:
+            self._next_id += 1
+            self.created_users.append({"id": self._next_id,
+                                       "payload": kwargs["json"]["user"]})
+            return FakeResp({"user": {"id": self._next_id}})
+        # tickets.json
+        self.posts.append((url, kwargs))
         self._next_id += 1
         return FakeResp({"ticket": {"id": self._next_id}})
 
@@ -246,6 +261,32 @@ def test_numeric_group_id_is_applied(client, monkeypatch):
     monkeypatch.setattr(main, "DEFAULT_GROUP_ID", "12345")
     post(client, _event("connected"))
     assert client.fake.posts[0][1]["json"]["ticket"]["group_id"] == 12345
+
+
+def test_unknown_caller_creates_customer_as_requester(client):
+    # No existing user for the caller -> create a customer (NOT default to the
+    # API account), using the caller ID + phone, and make them the requester.
+    r = post(client, _event("connected"))
+    assert "created" in r.json()
+    assert len(client.fake.created_users) == 1
+    created = client.fake.created_users[0]
+    assert created["payload"]["name"] == "Jane Tech"
+    assert created["payload"]["phone"] == "+15551112222"
+    assert client.fake.posts[0][1]["json"]["ticket"]["requester_id"] == created["id"]
+
+
+def test_existing_customer_matched_by_phone_is_requester(client):
+    client.fake.users_by_phone["5551112222"] = {"id": 777, "phone": "+1 (555) 111-2222"}
+    post(client, _event("connected"))
+    assert client.fake.posts[0][1]["json"]["ticket"]["requester_id"] == 777
+    assert client.fake.created_users == []   # reused existing, didn't create
+
+
+def test_unknown_caller_without_name_falls_back_to_phone(client):
+    ev = _event("voicemail_uploaded", voicemail_link="https://x/vm")
+    ev["contact"] = {"phone": "+15553334444", "type": "user"}   # no caller-ID name
+    post(client, ev)
+    assert client.fake.created_users[0]["payload"]["name"] == "+15553334444"
 
 
 def test_external_caller_is_skipped(client):

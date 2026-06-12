@@ -18,6 +18,7 @@ survive container restarts.
 """
 
 import os
+import re
 import json
 import logging
 
@@ -158,22 +159,66 @@ def _attach_extras(call_id: str, event: dict):
         _maybe_attach_voicemail(call_id, event)
 
 
-def _requester_id(event: dict):
-    """Best-effort: match the internal caller to an existing Zendesk end-user
-    by phone. For an internal desk the caller is almost always already a user."""
-    contact = event.get("contact") or {}
-    phone = contact.get("phone")
-    if not phone:
+def _norm_phone(p: str) -> str:
+    """Digits only, last 10 (US), for tolerant phone comparison across formats."""
+    d = re.sub(r"\D", "", p or "")
+    return d[-10:] if len(d) >= 10 else d
+
+
+def _find_user_by_phone(phone: str):
+    """Return the id of an existing Zendesk user whose PHONE actually matches,
+    else None. We require a real phone-field match (not just a fuzzy search hit)
+    so the call doesn't get attached to the wrong person."""
+    want = _norm_phone(phone)
+    if not want:
         return None
     try:
         r = httpx.get(f"{ZBASE}/users/search.json", params={"query": phone},
                       auth=ZAUTH, timeout=10)
         r.raise_for_status()
-        users = r.json().get("users", [])
-        return users[0]["id"] if users else None
+        for u in r.json().get("users", []):
+            if _norm_phone(u.get("phone")) == want:
+                return u["id"]
     except Exception as e:
-        log.warning("requester lookup failed for %s: %s", phone, e)
+        log.warning("user phone lookup failed for %s: %s", phone, e)
+    return None
+
+
+def _create_end_user(name: str, phone: str = None, email: str = None):
+    """Create (or update) a Zendesk end-user 'customer' for the caller, mirroring
+    the native integration when no match exists. Keyed on external_id=phone so a
+    repeat caller from the same number reuses the same customer (no duplicates)."""
+    user = {"name": name, "role": "end-user", "verified": True}
+    if phone:
+        user["phone"] = phone
+        user["external_id"] = f"dialpad:{_norm_phone(phone)}"
+    if email:
+        user["email"] = email
+    try:
+        r = httpx.post(f"{ZBASE}/users/create_or_update.json",
+                       json={"user": user}, auth=ZAUTH, timeout=15)
+        r.raise_for_status()
+        return r.json()["user"]["id"]
+    except Exception as e:
+        log.warning("end-user create failed for %s / %s: %s", name, phone, e)
         return None
+
+
+def _requester_id(event: dict):
+    """Resolve the ticket requester from the caller, like the native integration:
+    match an existing customer by phone, else create a new customer from the
+    caller ID (name) or the phone number. Returns None only when we have nothing
+    to go on — and only then does Zendesk fall back to the API account."""
+    contact = event.get("contact") or {}
+    phone = contact.get("phone")
+    name = contact.get("name")
+    email = contact.get("email")
+    uid = _find_user_by_phone(phone) if phone else None
+    if uid:
+        return uid
+    if not (name or phone or email):
+        return None
+    return _create_end_user(name or phone, phone, email)
 
 
 def _assignee_id(event: dict):

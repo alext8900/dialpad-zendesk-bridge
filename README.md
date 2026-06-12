@@ -20,7 +20,9 @@ internal IT help desk. This bridge subscribes to Dialpad's raw **Call Events**
 - On **recap_summary**: for *answered* calls, attaches Dialpad's **AI call recap**
   (summary + outcome + action items) as a private comment once it's ready (a
   voicemail has no recap, so it gets the recording/transcript instead)
-- Tries to match the caller to an existing Zendesk end-user by phone (requester)
+- **Requester** = the caller, like the native integration: matches an existing
+  Zendesk customer by phone, otherwise creates a new customer from the caller ID
+  (or the phone number). Never silently falls back to the API account.
 - **Answered calls are assigned to whoever picked up** — the agent's Dialpad email
   (from the event `target`) is matched to a Zendesk agent. Voicemails/missed calls
   are left unassigned so they fall into the default group for someone to grab.
