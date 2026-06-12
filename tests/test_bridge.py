@@ -26,8 +26,10 @@ from app import main, store
 
 
 class FakeResp:
-    def __init__(self, payload):
+    def __init__(self, payload=None, content=b"", headers=None):
         self._payload = payload
+        self.content = content
+        self.headers = headers or {}
 
     def json(self):
         return self._payload
@@ -37,25 +39,35 @@ class FakeResp:
 
 
 class FakeHttpx:
-    """Records every Zendesk call and returns canned responses.
+    """Records every call and returns canned responses.
 
     - GET  .../users/search.json  -> no matching end-user (skip requester)
+    - GET  dialpad secureblob link -> fake audio bytes
     - POST .../tickets.json       -> a new ticket with an incrementing id
-    - PUT  .../tickets/{id}.json  -> the enrich / recording updates
+    - POST .../uploads.json       -> a fake upload token
+    - PUT  .../tickets/{id}.json  -> the enrich / recap / voicemail updates
     """
 
     def __init__(self):
         self.posts = []
         self.puts = []
         self.gets = []
+        self.uploads = []
         self._next_id = 100
 
     def get(self, url, **kwargs):
         self.gets.append((url, kwargs))
-        return FakeResp({"users": []})
+        if "users/search" in url:
+            return FakeResp({"users": []})
+        # voicemail audio download
+        return FakeResp(content=b"FAKE-AUDIO-BYTES",
+                        headers={"content-type": "audio/mpeg"})
 
     def post(self, url, **kwargs):
         self.posts.append((url, kwargs))
+        if "uploads.json" in url:
+            self.uploads.append((url, kwargs))
+            return FakeResp({"upload": {"token": f"uptoken-{len(self.uploads)}"}})
         self._next_id += 1
         return FakeResp({"ticket": {"id": self._next_id}})
 
@@ -165,6 +177,23 @@ def test_voicemail_creates_ticket_with_recording_and_transcript(client):
     post(client, _event("transcription",
                         transcription_text="My laptop won't boot, please call back."))
     assert any("won't boot" in p[1]["json"]["ticket"]["comment"]["body"]
+               for p in client.fake.puts)
+
+
+def test_voicemail_audio_downloaded_and_attached_as_file(client, monkeypatch):
+    # With a Dialpad token present, the bridge downloads the audio and uploads it
+    # to Zendesk, attaching the file (not just the link) — like the native one.
+    monkeypatch.setattr(main, "DIALPAD_API_TOKEN", "dp-token")
+    monkeypatch.setattr(main, "ATTACH_VOICEMAIL_AUDIO", True)
+    post(client, _event("voicemail_uploaded",
+                        voicemail_link="https://dialpad.com/secureblob/voicemail/abc"))
+    # audio fetched from the dialpad link...
+    assert any("secureblob" in g[0] for g in client.fake.gets)
+    # ...uploaded to zendesk...
+    assert len(client.fake.uploads) == 1
+    assert client.fake.uploads[0][1]["content"] == b"FAKE-AUDIO-BYTES"
+    # ...and the upload token attached to a ticket comment.
+    assert any(p[1]["json"]["ticket"]["comment"].get("uploads") == ["uptoken-1"]
                for p in client.fake.puts)
 
 

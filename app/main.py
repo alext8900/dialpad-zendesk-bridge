@@ -37,6 +37,12 @@ ZENDESK_EMAIL = os.environ["ZENDESK_EMAIL"]
 ZENDESK_API_TOKEN = os.environ["ZENDESK_API_TOKEN"]
 TICKET_ON = os.environ.get("TICKET_ON", "inbound")      # inbound | outbound | both
 DEFAULT_GROUP_ID = os.environ.get("ZENDESK_GROUP_ID")
+# Dialpad API token (needs the 'recordings'/'recordings_export' scope) so the
+# bridge can DOWNLOAD the voicemail audio and re-upload it to Zendesk as a real
+# file attachment, like the native integration does. Without it, the bridge falls
+# back to dropping the voicemail_link as a comment.
+DIALPAD_API_TOKEN = os.environ.get("DIALPAD_API_TOKEN", "")
+ATTACH_VOICEMAIL_AUDIO = os.environ.get("ATTACH_VOICEMAIL_AUDIO", "true").lower() == "true"
 # States that should result in a ticket. 'connected' = answered (instant ticket).
 # 'hangup'/'voicemail' = safety net so missed calls still get a ticket. Drop
 # 'hangup' here if you DON'T want tickets for abandoned calls with no voicemail.
@@ -157,12 +163,45 @@ def _requester_id(event: dict):
         return None
 
 
-def _comment(ticket_id: int, body: str):
-    """Add a private comment to an existing ticket."""
+def _comment(ticket_id: int, body: str, uploads=None):
+    """Add a private comment to an existing ticket, optionally with file uploads
+    (Zendesk upload tokens from _zendesk_upload)."""
+    comment = {"body": body, "public": False}
+    if uploads:
+        comment["uploads"] = uploads
     r = httpx.put(f"{ZBASE}/tickets/{ticket_id}.json",
-                  json={"ticket": {"comment": {"body": body, "public": False}}},
-                  auth=ZAUTH, timeout=15)
+                  json={"ticket": {"comment": comment}}, auth=ZAUTH, timeout=15)
     r.raise_for_status()
+
+
+def _audio_ext(content_type: str) -> str:
+    ct = (content_type or "").lower()
+    if "wav" in ct:
+        return "wav"
+    if "ogg" in ct:
+        return "ogg"
+    if "mp4" in ct or "m4a" in ct or "aac" in ct:
+        return "m4a"
+    return "mp3"
+
+
+def _download_voicemail(link: str):
+    """Fetch the voicemail audio from Dialpad. The link is a secureblob URL that
+    requires the API token via bearer auth. Returns (bytes, content_type)."""
+    r = httpx.get(link, headers={"Authorization": f"Bearer {DIALPAD_API_TOKEN}"},
+                  timeout=60, follow_redirects=True)
+    r.raise_for_status()
+    return r.content, r.headers.get("content-type", "audio/mpeg")
+
+
+def _zendesk_upload(filename: str, data: bytes, content_type: str) -> str:
+    """Upload bytes to Zendesk and return the upload token to attach to a comment."""
+    r = httpx.post(f"{ZBASE}/uploads.json", params={"filename": filename},
+                   content=data,
+                   headers={"Content-Type": content_type or "application/binary"},
+                   auth=ZAUTH, timeout=60)
+    r.raise_for_status()
+    return r.json()["upload"]["token"]
 
 
 def _create_ticket(event: dict, answered: bool, voicemail: bool = False) -> int:
@@ -239,7 +278,19 @@ def _maybe_attach_voicemail(call_id: str, event: dict):
         return
     link = event.get("voicemail_link")
     if link and not store.vm_link_done(call_id):
-        _comment(ticket_id, f"Voicemail recording:\n{link}")
+        token = None
+        if ATTACH_VOICEMAIL_AUDIO and DIALPAD_API_TOKEN:
+            try:
+                data, ctype = _download_voicemail(link)
+                token = _zendesk_upload(
+                    f"voicemail-{call_id}.{_audio_ext(ctype)}", data, ctype)
+            except Exception as e:
+                log.warning("voicemail audio fetch/upload failed (call %s), "
+                            "falling back to link: %s", call_id, e)
+        if token:
+            _comment(ticket_id, "Voicemail recording attached.", uploads=[token])
+        else:
+            _comment(ticket_id, f"Voicemail recording:\n{link}")
         store.mark_vm_link(call_id)
         log.info("attached voicemail recording to ticket %s (call %s)", ticket_id, call_id)
     text = (event.get("transcription_text") or "").strip()

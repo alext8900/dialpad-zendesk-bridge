@@ -12,9 +12,11 @@ internal IT help desk. This bridge subscribes to Dialpad's raw **Call Events**
 - On **hangup**: safety net — creates a `missed-call` ticket for calls that rang
   out, and adds final call duration to the answered-call ticket
 - On **voicemail / voicemail_uploaded**: creates a `voicemail` ticket and attaches
-  the **voicemail recording** (`voicemail_link`) — this is the case the native
-  integration skips for internal calls. The voicemail **transcription** is
-  attached too when the `transcription` event fires (a beat later)
+  the **voicemail recording as an actual audio file** (downloaded from Dialpad and
+  re-uploaded to Zendesk, like the native integration) — this is the case the
+  native integration skips for internal calls. Falls back to a link if no Dialpad
+  API token is configured. The voicemail **transcription** is attached too when
+  the `transcription` event fires (a beat later)
 - On **recap_summary**: for *answered* calls, attaches Dialpad's **AI call recap**
   (summary + outcome + action items) as a private comment once it's ready (a
   voicemail has no recap, so it gets the recording/transcript instead)
@@ -33,8 +35,9 @@ internal IT help desk. This bridge subscribes to Dialpad's raw **Call Events**
 - A Zendesk API token + an agent email
 
 ## Run it
-1. `cp .env.example .env` and fill in the Zendesk values + a long random
-   `DIALPAD_WEBHOOK_SECRET`.
+1. `cp .env.example .env` and fill in the Zendesk values, a long random
+   `DIALPAD_WEBHOOK_SECRET`, and `DIALPAD_API_TOKEN` (needed to attach voicemail
+   audio files).
 2. `docker compose up -d --build`
 3. Expose `:8080` to the internet over HTTPS. Easiest: put it behind the same
    reverse proxy / tunnel you already use, or a Cloudflare Tunnel. Dialpad must
@@ -95,11 +98,13 @@ is still created on connect/hangup — only the recap comment is missing. If it'
 chronic, switch from event-driven recap to fetching it by `call_id` on a short
 delay after hangup.
 
-## Want the recording too (or instead)?
-The bridge attaches the AI recap, not the audio. To add the recording: the call
-event carries `recording_details[]` (objects with a `url`) plus `was_recorded`
-when the API key has the `recordings_export` scope. Add a `recording` state to
-the subscription and a handler that drops those URLs in a comment — or download
-each `url` with your Dialpad bearer token and push it through Zendesk's Uploads
-API for a real audio attachment. (Note: the field is `recording_details[].url`,
-not `recording_url`.)
+## Recordings
+- **Voicemails**: the audio is downloaded from Dialpad and attached to the ticket
+  as a real file (needs `DIALPAD_API_TOKEN` with the recordings scope; set
+  `ATTACH_VOICEMAIL_AUDIO=false` to attach the link instead).
+- **Answered calls**: get the AI recap, not the audio. If you also want the
+  *answered-call* recording, the event carries `recording_details[]` (objects with
+  a `url`) plus `was_recorded` when the key has the `recordings_export` scope —
+  subscribe to the `recording` state and reuse `_download_*`/`_zendesk_upload` to
+  attach it the same way voicemails are handled. (Field is `recording_details[].url`,
+  not `recording_url`.)
