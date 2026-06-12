@@ -20,7 +20,10 @@ internal IT help desk. This bridge subscribes to Dialpad's raw **Call Events**
 - On **recap_summary**: for *answered* calls, attaches Dialpad's **AI call recap**
   (summary + outcome + action items) as a private comment once it's ready (a
   voicemail has no recap, so it gets the recording/transcript instead)
-- Tries to match the caller to an existing Zendesk end-user by phone
+- Tries to match the caller to an existing Zendesk end-user by phone (requester)
+- **Answered calls are assigned to whoever picked up** — the agent's Dialpad email
+  (from the event `target`) is matched to a Zendesk agent. Voicemails/missed calls
+  are left unassigned so they fall into the default group for someone to grab.
 
 ## Prereqs
 - A Dialpad **admin/company API key** (the bridge uses it to register the webhook
@@ -75,7 +78,9 @@ internal IT help desk. This bridge subscribes to Dialpad's raw **Call Events**
 - `INTERNAL_CONTACT_TYPES` = `user` (default) — comma-list of `contact.type`
   values treated as internal (e.g. `user,room`) if your tenant differs.
 - `TICKET_ON` = `inbound` (default) | `outbound` | `both`
-- `ZENDESK_GROUP_ID` — route auto-tickets straight to the IT group
+- `ZENDESK_GROUP_ID` — **optional**; leave blank if your support group is the
+  Zendesk *default* group (unassigned tickets land there automatically). Only set
+  it to force a specific non-default group.
 - `CREATE_STATES` in `app/main.py` controls ticket timing. Default creates on
   `connected` (answer) with `hangup`/`voicemail` as the missed-call safety net.
   Remove `hangup` if you DON'T want tickets for abandoned calls that left no

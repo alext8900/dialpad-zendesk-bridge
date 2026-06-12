@@ -163,6 +163,29 @@ def _requester_id(event: dict):
         return None
 
 
+def _assignee_id(event: dict):
+    """For an ANSWERED call, the target is the agent who picked up (target.type
+    == 'user'). Match them to a Zendesk agent by email so the ticket is assigned
+    to whoever took the call. Returns None for non-user targets / no match, in
+    which case the ticket just lands in the default group for someone to grab."""
+    target = event.get("target") or {}
+    if (target.get("type") or "").lower() != "user":
+        return None
+    email = target.get("email")
+    if not email:
+        return None
+    try:
+        r = httpx.get(f"{ZBASE}/users/search.json", params={"query": email},
+                      auth=ZAUTH, timeout=10)
+        r.raise_for_status()
+        for u in r.json().get("users", []):
+            if u.get("role") in ("agent", "admin"):
+                return u["id"]
+    except Exception as e:
+        log.warning("assignee lookup failed for %s: %s", email, e)
+    return None
+
+
 def _comment(ticket_id: int, body: str, uploads=None):
     """Add a private comment to an existing ticket, optionally with file uploads
     (Zendesk upload tokens from _zendesk_upload)."""
@@ -239,6 +262,12 @@ def _create_ticket(event: dict, answered: bool, voicemail: bool = False) -> int:
     rid = _requester_id(event)
     if rid:
         ticket["requester_id"] = rid
+    # Answered calls go to whoever picked up; voicemails/missed stay unassigned
+    # so they fall into the default (Support) group for someone to grab.
+    if answered:
+        aid = _assignee_id(event)
+        if aid:
+            ticket["assignee_id"] = aid
     if DEFAULT_GROUP_ID:
         ticket["group_id"] = int(DEFAULT_GROUP_ID)
 

@@ -53,11 +53,15 @@ class FakeHttpx:
         self.puts = []
         self.gets = []
         self.uploads = []
+        self.agents = {}   # email -> zendesk agent id (for assignee lookup)
         self._next_id = 100
 
     def get(self, url, **kwargs):
         self.gets.append((url, kwargs))
         if "users/search" in url:
+            q = (kwargs.get("params") or {}).get("query", "")
+            if q in self.agents:
+                return FakeResp({"users": [{"id": self.agents[q], "role": "agent"}]})
             return FakeResp({"users": []})
         # voicemail audio download
         return FakeResp(content=b"FAKE-AUDIO-BYTES",
@@ -114,6 +118,24 @@ def test_answered_call_creates_one_ticket_on_connected(client):
     # Answered tickets are NOT tagged missed-call.
     ticket = client.fake.posts[0][1]["json"]["ticket"]
     assert "missed-call" not in ticket["tags"]
+
+
+def test_answered_call_assigned_to_agent_who_picked_up(client):
+    # On answer, target is the agent (target.type=user); assign by email match.
+    client.fake.agents = {"agent@demo.com": 555}
+    ev = _event("connected")
+    ev["target"] = {"type": "user", "name": "Agent Smith", "email": "agent@demo.com"}
+    post(client, ev)
+    ticket = client.fake.posts[0][1]["json"]["ticket"]
+    assert ticket["assignee_id"] == 555
+
+
+def test_voicemail_left_unassigned_for_the_group(client):
+    # Voicemails get no assignee -> default (Support) group.
+    r = post(client, _event("voicemail_uploaded", voicemail_link="https://x/vm"))
+    assert r.json()["voicemail"] is True
+    ticket = client.fake.posts[0][1]["json"]["ticket"]
+    assert "assignee_id" not in ticket
 
 
 def test_duplicate_connected_does_not_create_second_ticket(client):
