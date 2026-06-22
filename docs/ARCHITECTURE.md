@@ -141,7 +141,7 @@ never pruned — fine at this volume; add a periodic cleanup if `state.db` ever 
 
 ## Status
 
-- ✅ Deployed and live; 30 unit tests passing (HTTP mocked).
+- ✅ Deployed and live; 34 unit tests passing (HTTP mocked).
 - ✅L All cases in CAUDE.md "Cases covered" are implemented + tested.
 - ⏳ Open: clear `external_id` on the one pre-fix duplicate contact then merge;
   optional scope/queue rule (payloads are logged on ticketing events for this);

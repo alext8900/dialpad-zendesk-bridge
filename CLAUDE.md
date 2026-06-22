@@ -18,7 +18,7 @@ replacing, the native integration.
 2. Make a venv and run the tests — know the baseline before changing anything:
    ```bash
    python -m venv .venv && ./.venv/bin/pip install -r requirements-dev.txt
-   ./.venv/bin/python -m pytest -q          # expect: 30 passed
+   ./.venv/bin/python -m pytest -q          # expect: 34 passed
    ```
 3. Read the file you're about to change. The whole request-handling flow lives in
    `app/main.py:dialpad_webhook`.
