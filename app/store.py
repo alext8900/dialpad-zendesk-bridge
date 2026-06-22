@@ -49,14 +49,34 @@ def init():
         )
 
 
-def resolve_and_link(ids) -> str:
-    """Given all the call-graph ids on an event, return the canonical key they
-    belong to, linking every id to it. If several ids already map to different
-    keys (legs unified late), merge them — preferring the one that already has a
-    ticket — so the whole call collapses to a single ticket."""
-    ids = [str(i) for i in ids if i]
+_BAD_IDS = {"", "0", "null", "none", "false", "nil", "undefined"}
+
+
+def clean_ids(ids):
+    """Drop None / empty / junk ids ('null', '0', etc.) so unrelated calls can
+    never get unioned through a garbage shared id (the 'one cursed mega-ticket')."""
+    out = []
+    for i in ids:
+        if i is None:
+            continue
+        s = str(i).strip()
+        if s and s.lower() not in _BAD_IDS:
+            out.append(s)
+    return out
+
+
+def resolve_and_link(ids):
+    """Given all the call-graph ids on an event, return (canonical_key,
+    duplicate_ticket_ids), linking every id to the canonical key.
+
+    If several ids already map to different keys (legs unified late), merge them,
+    preferring a group that already has a ticket. If MORE THAN ONE of those groups
+    already has a ticket, that's a genuine duplicate: future updates are routed to
+    the one canonical ticket and the other ticket ids are returned so the caller
+    can log loudly and flag it — never silently orphaned."""
+    ids = clean_ids(ids)
     if not ids:
-        return None
+        return None, []
     with _conn() as c:
         found = []
         for alias in ids:
@@ -65,15 +85,23 @@ def resolve_and_link(ids) -> str:
             ).fetchone()
             if row and row[0] not in found:
                 found.append(row[0])
+
+        duplicates = []
         if not found:
             canonical = ids[0]
         elif len(found) == 1:
             canonical = found[0]
         else:
-            with_ticket = [k for k in found if c.execute(
-                "SELECT 1 FROM calls WHERE call_id = ? AND ticket_id IS NOT NULL",
-                (k,)).fetchone()]
-            canonical = (with_ticket or found)[0]
+            ticketed = {}  # call_key -> ticket_id, for groups that already ticketed
+            for k in found:
+                row = c.execute(
+                    "SELECT ticket_id FROM calls WHERE call_id = ? AND ticket_id IS NOT NULL",
+                    (k,)).fetchone()
+                if row:
+                    ticketed[k] = row[0]
+            canonical = next(iter(ticketed)) if ticketed else found[0]
+            # any OTHER already-ticketed group is a real duplicate ticket
+            duplicates = [tid for k, tid in ticketed.items() if k != canonical]
             for other in found:
                 if other != canonical:
                     c.execute("UPDATE aliases SET call_key = ? WHERE call_key = ?",
@@ -84,7 +112,7 @@ def resolve_and_link(ids) -> str:
                 "ON CONFLICT(alias) DO UPDATE SET call_key = excluded.call_key",
                 (alias, canonical),
             )
-        return canonical
+        return canonical, duplicates
 
 
 def get_ticket(call_id: str):

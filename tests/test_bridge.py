@@ -246,6 +246,55 @@ def test_operator_and_callcenter_legs_collapse_to_one_ticket(client, monkeypatch
                for p in client.fake.puts)
 
 
+def test_callcenter_leg_first_then_operator_one_ticket(client, monkeypatch):
+    # Goblin order: the call-center leg arrives and creates first (fallback),
+    # then the operator leg arrives — must join, not make a second ticket.
+    monkeypatch.setattr(main, "DIALPAD_API_TOKEN", "dp")
+    client.fake.operator_legs["OP"] = {
+        "target": {"type": "user", "name": "Alex", "email": "alex@x.com"}}
+    cc = _event("hangup", call_id="CC", master_call_id="ROOT", operator_call_id="OP",
+                date_connected=1, talk_time=120000)
+    cc["target"] = {"type": "call_center", "name": "IT - AS400"}
+    post(client, cc)
+    assert len(client.fake.posts) == 1
+    op = _event("connected", call_id="OP", entry_point_call_id="CC", date_connected=1)
+    op["target"] = {"type": "user", "name": "Alex", "email": "alex@x.com"}
+    post(client, op)
+    assert len(client.fake.posts) == 1                 # joined, no second ticket
+
+
+def test_junk_shared_id_does_not_union_unrelated_calls(client):
+    # Two unrelated calls that both carry a junk operator_call_id must NOT merge.
+    a = _event("connected", call_id="AAA", operator_call_id="null", date_connected=1)
+    b = _event("connected", call_id="BBB", operator_call_id="null", date_connected=1)
+    post(client, a)
+    post(client, b)
+    assert len(client.fake.posts) == 2                 # two separate tickets
+    assert main._candidate_ids({"call_id": 123, "master_call_id": None,
+                                "operator_call_id": "null"}) == ["123"]
+
+
+def test_duplicate_tickets_detected_loudly_not_orphaned(client):
+    # Two answered legs with disjoint ids each create a ticket; a later leg links
+    # them. We must NOT silently orphan one — flag the duplicate on the canonical.
+    a = _event("connected", call_id="A", date_connected=1)
+    a["target"] = {"type": "user", "name": "Ann", "email": "ann@x.com"}
+    b = _event("connected", call_id="B", date_connected=1)
+    b["target"] = {"type": "user", "name": "Bob", "email": "bob@x.com"}
+    post(client, a)
+    post(client, b)
+    assert len(client.fake.posts) == 2                 # the pre-existing dup
+    # linking leg ties A and B together
+    link = _event("hangup", call_id="C", master_call_id="A", operator_call_id="B",
+                  date_connected=1, talk_time=60000)
+    link["target"] = {"type": "call_center", "name": "IT - AS400"}
+    post(client, link)
+    assert len(client.fake.posts) == 2                 # no THIRD ticket made
+    notes = [p[1]["json"]["ticket"].get("comment", {}).get("body", "")
+             for p in client.fake.puts]
+    assert any("Duplicate detected" in n for n in notes)
+
+
 def test_transfer_hop_makes_no_extra_ticket(client):
     hop = _event("hangup", call_id="HOP", talk_time=0, master_call_id="M")
     hop["target"] = {"type": "call_center", "name": "IT - AS400"}

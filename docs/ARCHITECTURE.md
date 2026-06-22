@@ -104,6 +104,13 @@ arriving legs (and merging if two groups collide, preferring the one with a
 ticket). On each answered leg we re-assign (last-answerer-owns), so a transferred
 call ends up on whoever finally handled it.
 
+Guards on the alias map: junk ids (`null`/`""`/`0`/etc.) are dropped before
+unioning so unrelated calls can't merge through a garbage shared id; and if two
+groups that *already have tickets* turn out to be one call, that's logged loudly
+and flagged with a note on the canonical ticket (updates route there) rather than
+silently orphaning the other. The `aliases` table grows ~1 row per leg/id and is
+never pruned — fine at this volume; add a periodic cleanup if `state.db` ever bloats.
+
 ---
 
 ## Decision log

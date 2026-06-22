@@ -111,7 +111,9 @@ _ID_FIELDS = ("call_id", "master_call_id", "entry_point_call_id", "operator_call
 
 
 def _candidate_ids(event: dict):
-    return [event.get(f) for f in _ID_FIELDS if event.get(f)]
+    # store.clean_ids drops None / "" / "null" / "0" etc. so unrelated calls can't
+    # union through a junk shared id.
+    return store.clean_ids(event.get(f) for f in _ID_FIELDS)
 
 
 @app.post("/dialpad/webhook")
@@ -130,13 +132,29 @@ async def dialpad_webhook(request: Request):
     # The legs cross-reference each other by DIFFERENT fields (master_call_id,
     # entry_point_call_id, operator_call_id) and no single field is on all of them,
     # so we union every id into one canonical key -> ONE ticket per call.
-    key = store.resolve_and_link(_candidate_ids(event))
+    candidate_ids = _candidate_ids(event)
+    if not candidate_ids:
+        return {"ignored": "no usable call id"}
+    key, dup_tickets = store.resolve_and_link(candidate_ids)
     talk_secs = round((event.get("talk_time") or 0) / 1000)
     log.info("event call_id=%s key=%s state=%s dir=%s contact=%s:%s target=%s:%s talk=%ss",
              call_id, key, state, direction, contact.get("type"), contact.get("name"),
              target.get("type"), target.get("name"), talk_secs)
     if DEBUG_PAYLOAD:
         log.info("payload call_id=%s %s", call_id, json.dumps(event, default=str))
+
+    # Two legs each already made a ticket and we just learned they're the SAME
+    # call. Don't silently orphan one — route future updates to the canonical
+    # ticket, log loudly, and flag it on the ticket for a human to merge/close.
+    if dup_tickets:
+        log.warning("DUPLICATE TICKETS for one call: canonical key=%s ticket=%s; "
+                    "other ticket(s) %s now orphaned — MERGE/CLOSE them.",
+                    key, store.get_ticket(key), dup_tickets)
+        canon_tid = store.get_ticket(key)
+        if canon_tid:
+            _comment(canon_tid, "⚠️ Duplicate detected: this call also created "
+                     + ", ".join(f"#{t}" for t in dup_tickets)
+                     + ". Updates route here now — please merge/close the other(s).")
 
     # Attach-only signals can arrive on their own event after the call ends
     # (AI recap, voicemail recording, voicemail transcription). They no-op
