@@ -44,4 +44,3 @@ A real contact-center call (Trey↔Alex) was making 2 tickets; fixed with the al
 map + conflict handling. Worth confirming on the next live CC call that it's a
 single ticket. If it ever splits again, the `ticketing[...]` payload logs show the
 id relationships.
-</content>
