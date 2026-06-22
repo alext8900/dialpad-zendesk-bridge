@@ -45,9 +45,12 @@ replacing, the native integration.
 `POST /dialpad/webhook` (`app/main.py`) decodes the event (JWT if a secret is set,
 else plain JSON), then:
 
-1. **Key the call on `master_call_id`** (falls back to `entry_point_call_id`, then
-   `call_id`). One real call rings/transfers through many legs, each with its own
-   `call_id`, but all share `master_call_id` → **one ticket per call**.
+1. **Union all the call-graph ids into one canonical key** (`store.resolve_and_link`
+   over `call_id` / `master_call_id` / `entry_point_call_id` / `operator_call_id`).
+   One real call rings/transfers through many legs that cross-reference each other
+   by **different** fields (no single id is on all of them), so an alias map unions
+   them → **one ticket per call**. (A single key like `master_call_id` is NOT
+   enough — the operator/agent leg can have `master_call_id: null`.)
 2. **Attach-only signals** (recap, voicemail recording, transcription) are applied
    first; they no-op if no ticket exists yet, so they're safe for any leg.
 3. **Filters:** `TICKET_ON` (direction) and `INTERNAL_ONLY` (only `contact.type`
@@ -107,11 +110,16 @@ else plain JSON), then:
 
 ## Verified Dialpad payload facts (don't re-learn these the hard way)
 
-- `master_call_id` — present on **every** leg incl. transfers → the dedup key.
-  `entry_point_call_id` was **null** in practice; don't rely on it.
+- **No single id links all legs.** A call fans into the department/entry leg, the
+  call-center leg, and the operator/agent leg. They cross-reference each other:
+  call-center leg has `master_call_id`=root + `operator_call_id`=agent-leg's id;
+  the operator leg has `master_call_id: null` and `entry_point_call_id`=call-center
+  leg's id. → must union `call_id`/`master_call_id`/`entry_point_call_id`/
+  `operator_call_id` (the alias map), not key on one field.
 - Answered contact-center leg has `target.type == "call_center"` (underscore!),
-  **not** `user`. The agent is a separate leg in `operator_call_id`, and that leg
-  is **not always delivered** to our subscriptions → fetch it.
+  **not** `user`. The agent is a separate leg in `operator_call_id`; sometimes
+  it's delivered as its own event (target == the agent), sometimes not → fetch it
+  via `GET /api/v2/call/{operator_call_id}` when needed.
 - `date_connected` is set when an agent picks up; `talk_time` (ms) is real agent
   talk time (excludes IVR/queue/ring) and is only populated at `hangup`.
 - `duration` / `total_duration` **include IVR menu time** — misleading for "how

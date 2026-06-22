@@ -202,6 +202,50 @@ def test_duplicate_connected_does_not_double_create(client):
     assert len(client.fake.posts) == 1
 
 
+def test_operator_and_callcenter_legs_collapse_to_one_ticket(client, monkeypatch):
+    # The real bug: a call has 3 legs that cross-reference by DIFFERENT fields and
+    # share no single id — department (root), operator/agent leg, call-center leg.
+    # They must all collapse to ONE ticket via the alias map.
+    monkeypatch.setattr(main, "DIALPAD_API_TOKEN", "dp")
+    client.fake.agents = {"alex@x.com": 7}
+    client.fake.operator_legs["OP"] = {
+        "target": {"type": "user", "name": "Alex", "email": "alex@x.com"}}
+
+    # 1) department entry leg hangs up (transferred out) — no answer, no ticket
+    dept = _event("hangup", call_id="ROOT", talk_time=0)
+    dept["target"] = {"type": "department", "name": "IT Department"}
+    post(client, dept)
+    assert len(client.fake.posts) == 0
+
+    # 2) operator (Alex) leg answers — master null, entry_point points at the CC leg
+    op = _event("connected", call_id="OP", entry_point_call_id="CC", date_connected=1)
+    op["target"] = {"type": "user", "name": "Alex", "email": "alex@x.com"}
+    post(client, op)
+    assert len(client.fake.posts) == 1
+
+    # 3) operator leg hangs up -> length onto the same ticket
+    oph = _event("hangup", call_id="OP", entry_point_call_id="CC", date_connected=1,
+                 talk_time=221000)
+    oph["target"] = {"type": "user", "name": "Alex", "email": "alex@x.com"}
+    post(client, oph)
+
+    # 4) call-center leg hangs up — master=ROOT, operator_call_id=OP. Must NOT
+    #    create a second ticket (this was ticket 197 in prod).
+    cc = _event("hangup", call_id="CC", master_call_id="ROOT", operator_call_id="OP",
+                date_connected=1, talk_time=221000)
+    cc["target"] = {"type": "call_center", "name": "IT - Technical Support (Don't call)"}
+    post(client, cc)
+    assert len(client.fake.posts) == 1                 # STILL one ticket
+
+    # 5) recap attaches to that same ticket
+    rc = _event("recap_summary", call_id="CC", master_call_id="ROOT",
+                operator_call_id="OP", recap_summary="Resolved printer issue.")
+    post(client, rc)
+    assert any("Resolved printer issue" in
+               p[1]["json"]["ticket"].get("comment", {}).get("body", "")
+               for p in client.fake.puts)
+
+
 def test_transfer_hop_makes_no_extra_ticket(client):
     hop = _event("hangup", call_id="HOP", talk_time=0, master_call_id="M")
     hop["target"] = {"type": "call_center", "name": "IT - AS400"}

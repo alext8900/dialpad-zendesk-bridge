@@ -37,6 +37,54 @@ def init():
             c.execute("ALTER TABLE calls ADD COLUMN subject TEXT")
         except sqlite3.OperationalError:
             pass
+        # Alias map: any Dialpad call-graph id (call_id / master_call_id /
+        # entry_point_call_id / operator_call_id) -> the ONE canonical key for the
+        # call. Legs cross-reference each other by different fields, so we union
+        # all of them into a single ticket. See resolve_and_link().
+        c.execute(
+            """CREATE TABLE IF NOT EXISTS aliases (
+                   alias TEXT PRIMARY KEY,
+                   call_key TEXT NOT NULL
+               )"""
+        )
+
+
+def resolve_and_link(ids) -> str:
+    """Given all the call-graph ids on an event, return the canonical key they
+    belong to, linking every id to it. If several ids already map to different
+    keys (legs unified late), merge them — preferring the one that already has a
+    ticket — so the whole call collapses to a single ticket."""
+    ids = [str(i) for i in ids if i]
+    if not ids:
+        return None
+    with _conn() as c:
+        found = []
+        for alias in ids:
+            row = c.execute(
+                "SELECT call_key FROM aliases WHERE alias = ?", (alias,)
+            ).fetchone()
+            if row and row[0] not in found:
+                found.append(row[0])
+        if not found:
+            canonical = ids[0]
+        elif len(found) == 1:
+            canonical = found[0]
+        else:
+            with_ticket = [k for k in found if c.execute(
+                "SELECT 1 FROM calls WHERE call_id = ? AND ticket_id IS NOT NULL",
+                (k,)).fetchone()]
+            canonical = (with_ticket or found)[0]
+            for other in found:
+                if other != canonical:
+                    c.execute("UPDATE aliases SET call_key = ? WHERE call_key = ?",
+                              (canonical, other))
+        for alias in ids:
+            c.execute(
+                "INSERT INTO aliases (alias, call_key) VALUES (?, ?) "
+                "ON CONFLICT(alias) DO UPDATE SET call_key = excluded.call_key",
+                (alias, canonical),
+            )
+        return canonical
 
 
 def get_ticket(call_id: str):

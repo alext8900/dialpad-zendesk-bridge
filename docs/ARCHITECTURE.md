@@ -85,13 +85,24 @@ length appended). Neither phase depends on the other landing.
 
 ## The call-graph problem (why dedup matters)
 
-A single real call fans out into **many legs**, each with its own `call_id`:
-the entry-point/queue leg, one operator leg per agent it rings, and a new set on
-every transfer. Keying tickets on `call_id` made a ticket *per leg* (e.g. one to
-the queue→Support, one to the agent). The fix: key on **`master_call_id`**, which
-is identical across all legs and transfers → exactly one ticket per call. On each
-answered leg we re-assign (last-answerer-owns), so a transferred call ends up on
-whoever finally handled it.
+A single real call fans out into **many legs**, each with its own `call_id`: the
+department/entry leg, the call-center leg, one operator leg per agent it rings, and
+a new set on every transfer. The legs cross-reference each other by **different**
+fields and **no single id is on all of them**:
+
+- call-center leg: `master_call_id` = the department/root id, `operator_call_id` =
+  the agent leg's `call_id`.
+- operator/agent leg: `master_call_id: null`, `entry_point_call_id` = the
+  call-center leg's `call_id`.
+- department leg: its own `call_id` is the root the call-center leg points at.
+
+So keying on any one field splits the call (real prod bug: one ticket to the
+agent, a second to the queue). The fix is an **alias map** (`store.resolve_and_link`):
+treat all of `call_id` / `master_call_id` / `entry_point_call_id` /
+`operator_call_id` on every leg as aliases for one canonical key, unioning late-
+arriving legs (and merging if two groups collide, preferring the one with a
+ticket). On each answered leg we re-assign (last-answerer-owns), so a transferred
+call ends up on whoever finally handled it.
 
 ---
 
@@ -124,7 +135,7 @@ whoever finally handled it.
 ## Status
 
 - ✅ Deployed and live; 30 unit tests passing (HTTP mocked).
-- ✅ All cases in CLAUDE.md "Cases covered" are implemented + tested.
+- ✅L All cases in CAUDE.md "Cases covered" are implemented + tested.
 - ⏳ Open: clear `external_id` on the one pre-fix duplicate contact then merge;
   optional scope/queue rule (payloads are logged on ticketing events for this);
   CI not wired; FastAPI `on_event` → lifespan (cosmetic).

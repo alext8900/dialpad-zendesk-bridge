@@ -13,10 +13,12 @@ internal IT help desk. This bridge subscribes to Dialpad's raw **Call Events**
   == user`), and finalized on **hangup** by appending the call length. Hangup also
   creates as a fallback if the connected event was missed. Menu-disconnects,
   abandons, and transfer hops never set those answer fields, so they don't ticket.
-- **One ticket per call.** A call rings/transfers through many legs, each with its
-  own `call_id`, but all share `master_call_id` — the bridge dedupes on that, so
-  transfers and contact-center fan-out collapse to a single ticket. On each answer
-  it re-assigns to whoever just picked up (last-answerer-owns).
+- **One ticket per call.** A call rings/transfers through many legs that
+  cross-reference each other by different ids (no single field is on all of them),
+  so the bridge unions `call_id`/`master_call_id`/`entry_point_call_id`/
+  `operator_call_id` into one canonical key (alias map) — transfers and
+  contact-center fan-out collapse to a single ticket. On each answer it re-assigns
+  to whoever just picked up (last-answerer-owns).
 - **Assigned to whoever answered.** For a direct call the answering agent is the
   `target`; for a contact-center call the target is the call center and the agent
   is a separate operator leg, fetched via `operator_call_id` (Dialpad `GET

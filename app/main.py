@@ -105,6 +105,15 @@ def _decode(raw: bytes) -> dict:
     return json.loads(body)
 
 
+# Every call-graph id a leg might carry. All of these refer to the same real call,
+# so we union them onto one canonical key (store.resolve_and_link).
+_ID_FIELDS = ("call_id", "master_call_id", "entry_point_call_id", "operator_call_id")
+
+
+def _candidate_ids(event: dict):
+    return [event.get(f) for f in _ID_FIELDS if event.get(f)]
+
+
 @app.post("/dialpad/webhook")
 async def dialpad_webhook(request: Request):
     event = _decode(await request.body())
@@ -117,11 +126,11 @@ async def dialpad_webhook(request: Request):
 
     contact = event.get("contact") or {}
     target = event.get("target") or {}
-    # One real call rings/transfers through many legs, each with its own call_id,
-    # but they ALL share master_call_id (present even across transfers). Key on
-    # that so the whole call is ONE ticket. Fall back to entry_point_call_id, then
-    # this leg's own id for simple direct calls.
-    key = str(event.get("master_call_id") or event.get("entry_point_call_id") or call_id)
+    # One real call rings/transfers through many legs, each with its own call_id.
+    # The legs cross-reference each other by DIFFERENT fields (master_call_id,
+    # entry_point_call_id, operator_call_id) and no single field is on all of them,
+    # so we union every id into one canonical key -> ONE ticket per call.
+    key = store.resolve_and_link(_candidate_ids(event))
     talk_secs = round((event.get("talk_time") or 0) / 1000)
     log.info("event call_id=%s key=%s state=%s dir=%s contact=%s:%s target=%s:%s talk=%ss",
              call_id, key, state, direction, contact.get("type"), contact.get("name"),
