@@ -47,6 +47,7 @@ class FakeHttpx:
         self.created_users = []
         self.agents = {}           # email -> zendesk agent id
         self.users_by_phone = {}   # normalized phone -> {"id","phone"}
+        self.users_by_email = {}   # email -> {"id","email","role"}
         self.operator_legs = {}    # dialpad call_id -> call json
         self._next_id = 100
 
@@ -55,7 +56,10 @@ class FakeHttpx:
         if "users/search" in url:
             q = (kwargs.get("params") or {}).get("query", "")
             if q in self.agents:
-                return FakeResp({"users": [{"id": self.agents[q], "role": "agent"}]})
+                return FakeResp({"users": [{"id": self.agents[q], "role": "agent",
+                                            "email": q}]})
+            if q in self.users_by_email:
+                return FakeResp({"users": [self.users_by_email[q]]})
             norm = re.sub(r"\D", "", q)[-10:]
             if norm and norm in self.users_by_phone:
                 return FakeResp({"users": [self.users_by_phone[norm]]})
@@ -445,6 +449,39 @@ def test_existing_customer_matched_by_phone(client):
     post(client, _answer())
     assert client.fake.posts[0][1]["json"]["ticket"]["requester_id"] == 777
     assert client.fake.created_users == []
+
+
+def test_support_agent_caller_not_downgraded(client):
+    # A support agent calls the help desk. Their phone isn't on their Zendesk
+    # profile, but their email is. We MUST reuse their agent account as the
+    # requester — never create_or_update them, which would downgrade them to
+    # end-user (the reported prod bug).
+    client.fake.agents = {"jane.agent@bpiteam.com": 42}
+    ev = _answer()
+    ev["contact"] = {"name": "Jane Agent", "phone": "+15559998888",
+                     "type": "user", "email": "jane.agent@bpiteam.com"}
+    post(client, ev)
+    assert client.fake.created_users == []          # never touched their account
+    assert client.fake.posts[0][1]["json"]["ticket"]["requester_id"] == 42
+
+
+def test_existing_user_matched_by_email_reused(client):
+    # A known caller (no phone match) is reused by email rather than re-created.
+    client.fake.users_by_email["bob@bpiteam.com"] = {
+        "id": 888, "email": "bob@bpiteam.com", "role": "end-user"}
+    ev = _answer()
+    ev["contact"] = {"name": "Bob", "phone": "+15550001111",
+                     "type": "user", "email": "bob@bpiteam.com"}
+    post(client, ev)
+    assert client.fake.created_users == []
+    assert client.fake.posts[0][1]["json"]["ticket"]["requester_id"] == 888
+
+
+def test_created_customer_carries_no_role_downgrade(client):
+    # A brand-new caller still becomes a customer, but we never send a role field
+    # (so create_or_update can't downgrade an account it matches by email).
+    post(client, _answer())
+    assert client.fake.created_users[0]["payload"].get("role") is None
 
 
 def test_unknown_caller_without_name_uses_phone(client):

@@ -292,13 +292,39 @@ def _find_user_by_phone(phone: str):
     return None
 
 
+def _find_user_by_email(email: str):
+    """Return the id of an existing Zendesk user (ANY role) whose email EXACTLY
+    matches, else None. Critical for protecting support staff: when an agent or
+    admin calls the help desk, we must reuse their account as the requester — never
+    create_or_update them, because that would downgrade their role to end-user
+    (real prod bug). Requires an exact match since the search endpoint is fuzzy."""
+    want = (email or "").strip().lower()
+    if not want:
+        return None
+    try:
+        r = httpx.get(f"{ZBASE}/users/search.json", params={"query": email},
+                      auth=ZAUTH, timeout=10)
+        r.raise_for_status()
+        for u in r.json().get("users", []):
+            if (u.get("email") or "").strip().lower() == want:
+                return u["id"]
+    except Exception as e:
+        log.warning("user email lookup failed for %s: %s", email, e)
+    return None
+
+
 def _create_end_user(name: str, phone: str = None, email: str = None):
-    """Create (or update) a Zendesk end-user 'customer' for the caller, mirroring
-    the native integration when no match exists. Deliberately does NOT set an
-    external_id: an external_id makes the contact impossible to merge later, which
-    is a problem when Dialpad has stale info (e.g. someone's email changed) and a
-    duplicate gets made. Repeat callers are deduped by the phone search instead."""
-    user = {"name": name, "role": "end-user", "verified": True}
+    """Create a Zendesk end-user 'customer' for a caller we couldn't match to an
+    existing account, mirroring the native integration. Deliberately does NOT set
+    an external_id: an external_id makes the contact impossible to merge later,
+    which is a problem when Dialpad has stale info (e.g. someone's email changed)
+    and a duplicate gets made. Repeat/known callers are reused via the phone/email
+    lookups in _requester_id before we ever get here.
+
+    Note: we do NOT send role here. New users default to end-user in Zendesk, and
+    omitting role means that if create_or_update ever matches an existing account
+    by email (e.g. a support agent), it can't be downgraded — protecting staff."""
+    user = {"name": name, "verified": True}
     if phone:
         user["phone"] = phone
     if email:
@@ -314,15 +340,23 @@ def _create_end_user(name: str, phone: str = None, email: str = None):
 
 
 def _requester_id(event: dict):
-    """Resolve the ticket requester from the caller, like the native integration:
-    match an existing customer by phone, else create a new customer from the
-    caller ID (name) or the phone number. Returns None only when we have nothing
-    to go on — and only then does Zendesk fall back to the API account."""
+    """Resolve the ticket requester from the caller, like the native integration.
+    Reuse an existing Zendesk user (by phone, then by email) — never modify them —
+    else create a new customer from the caller ID (name) or phone. Returns None
+    only when we have nothing to go on (then Zendesk falls back to the API account).
+
+    Matching by email matters most for SUPPORT STAFF calling the help desk: an
+    agent/admin already has a Zendesk account, so we reuse it as the requester. We
+    must NOT route them through create_or_update — that downgrades their role to
+    end-user (a real bug). An agent is allowed to be a ticket requester."""
     contact = event.get("contact") or {}
     phone = contact.get("phone")
     name = contact.get("name")
     email = contact.get("email")
     uid = _find_user_by_phone(phone) if phone else None
+    if uid:
+        return uid
+    uid = _find_user_by_email(email) if email else None
     if uid:
         return uid
     if not (name or phone or email):

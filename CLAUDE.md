@@ -18,7 +18,7 @@ replacing, the native integration.
 2. Make a venv and run the tests — know the baseline before changing anything:
    ```bash
    python -m venv .venv && ./.venv/bin/pip install -r requirements-dev.txt
-   ./.venv/bin/python -m pytest -q          # expect: 34 passed
+   ./.venv/bin/python -m pytest -q          # expect: 37 passed
    ```
 3. Read the file you're about to change. The whole request-handling flow lives in
    `app/main.py:dialpad_webhook`.
@@ -88,9 +88,13 @@ else plain JSON), then:
 - ✅ No agent resolvable → ticket left unassigned in the default (Support) group.
 
 **Requester (caller)**
-- ✅ Matched to an existing Zendesk customer by phone (exact, last-10-digit match).
+- ✅ Matched to an existing Zendesk user by phone (exact, last-10-digit match),
+  then by **email** (exact). Existing users — including **support agents/admins
+  calling the help desk** — are reused as the requester, never modified, so an
+  agent is never downgraded to end-user.
 - ✅ Otherwise a new customer is created from the caller ID / phone — never falls
-  back to the API account.
+  back to the API account. The create sends **no `role`** (defaults to end-user),
+  so a stray email match can't downgrade an account.
 - ✅ Created customers carry **no `external_id`** so they stay mergeable (Dialpad
   can have stale info, e.g. a changed email → a duplicate that must be mergeable).
 
@@ -177,6 +181,11 @@ else plain JSON), then:
 - **env_file inline comments** → polluted values / 500. → comments on their own
   lines; `_cfg()` strips them defensively.
 - **Contact `external_id`** makes Zendesk contacts unmergeable. → don't set it.
+- **Agent downgraded to end-user:** a support agent calling the help desk got their
+  Zendesk role flipped to end-user, because `users/create_or_update.json` matches by
+  email and we sent `role: end-user`. → resolve the requester by reusing any existing
+  user (phone **and** email lookup) and never send `role` on create. Re-promote any
+  already-downgraded agent in Zendesk by hand.
 
 ---
 

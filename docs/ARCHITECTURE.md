@@ -133,15 +133,19 @@ never pruned — fine at this volume; add a periodic cleanup if `state.db` ever 
   recap; an answered call's recap is more useful than the raw recording.
 - **Voicemail audio as a real file** — download from `voicemail_link`, re-upload to
   Zendesk Uploads API, matching the native experience.
-- **Requester: match-or-create, no `external_id`** — an `external_id` blocks
-  Zendesk merges, which breaks when Dialpad has stale caller info.
+- **Requester: reuse-or-create, no `external_id`, no role downgrade** — match an
+  existing Zendesk user by phone then email and reuse it untouched; only create a
+  new customer when nothing matches. An `external_id` blocks Zendesk merges, so we
+  don't set one. We also never send `role` on create: `create_or_update` matches by
+  email, so sending `role: end-user` downgraded a support agent who called the help
+  desk — reusing the existing account (and omitting role) protects staff.
 - **Call center as a slugged tag, `(Don't Call)` stripped** — matches native.
 
 ---
 
 ## Status
 
-- ✅ Deployed and live; 34 unit tests passing (HTTP mocked).
+- ✅ Deployed and live; 37 unit tests passing (HTTP mocked).
 - ✅L All cases in CAUDE.md "Cases covered" are implemented + tested.
 - ⏳ Open: clear `external_id` on the one pre-fix duplicate contact then merge;
   optional scope/queue rule (payloads are logged on ticketing events for this);

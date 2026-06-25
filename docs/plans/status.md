@@ -8,7 +8,7 @@ Last updated: 2026-06-22. Read `CLAUDE.md` (rules + cases), `docs/ARCHITECTURE.m
 - **Live in production.** Repo `github.com/alext8900/dialpad-zendesk-bridge` (public).
   Deploy = push to `main` → `git pull` on the Windows Docker host → `docker compose
   up -d --build`. Public URL `https://dialpad.bpiteam.com` via Cloudflare Tunnel.
-- **34 unit tests passing** (`./.venv/bin/python -m pytest -q`, HTTP mocked).
+- **37 unit tests passing** (`./.venv/bin/python -m pytest -q`, HTTP mocked).
 - All cases in CLAUDE.md "Cases covered" are implemented + tested.
 
 ## What works (high level)
