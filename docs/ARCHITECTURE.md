@@ -60,8 +60,10 @@ flowchart TD
 
 **Two-phase, independently recoverable:** Phase 1 creates on `connected`; Phase 2
 finalizes (length) on `hangup`. If `connected` is missed, `hangup` creates as a
-fallback. If `hangup` is missed, the ticket still exists from `connected` (just no
-length appended). Neither phase depends on the other landing.
+fallback. If `hangup` is missed, the ticket still exists from `connected`, and the
+length is **backfilled** from the next event carrying `talk_time` (the recap, which
+always includes it) — so a dropped hangup no longer loses the duration. Neither
+phase depends on the other landing.
 
 ---
 
@@ -76,7 +78,7 @@ length appended). Neither phase depends on the other landing.
 | `hangup` (unanswered) | ignore |
 | `voicemail_uploaded` | create voicemail ticket; attach audio file |
 | `transcription` | attach voicemail transcription |
-| `recap_summary` | attach AI recap to the answered-call ticket |
+| `recap_summary` | attach AI recap; backfill call length if `hangup` was missed |
 
 "Answered" = `date_connected` set AND (`operator_call_id` set OR
 `target.type == "user"`). Menu-disconnects / ring-outs set none of these.
@@ -145,7 +147,7 @@ never pruned — fine at this volume; add a periodic cleanup if `state.db` ever 
 
 ## Status
 
-- ✅ Deployed and live; 37 unit tests passing (HTTP mocked).
+- ✅ Deployed and live; 39 unit tests passing (HTTP mocked).
 - ✅L All cases in CAUDE.md "Cases covered" are implemented + tested.
 - ⏳ Open: clear `external_id` on the one pre-fix duplicate contact then merge;
   optional scope/queue rule (payloads are logged on ticketing events for this);

@@ -200,6 +200,29 @@ def test_hangup_fallback_creates_if_connected_missed(client):
     assert _subject_of(client.fake).endswith("· 1 min 28 sec")
 
 
+def test_recap_backfills_length_when_hangup_missed(client):
+    # Real prod case (Gabby/Travis): the 'hangup' event was never delivered, so
+    # the length was never appended. The recap_summary carries the final talk_time
+    # (284000ms) — use it to backfill the duration onto the subject.
+    post(client, _answer(master_call_id="M"))
+    assert "·" not in _subject_of(client.fake)              # no length yet at answer
+    post(client, _event("recap_summary", call_id="L2", master_call_id="M",
+                        recap_summary="Resolved login issue.", talk_time=284000))
+    subj_puts = [p for p in client.fake.puts if "subject" in p[1]["json"]["ticket"]]
+    assert subj_puts and subj_puts[-1][1]["json"]["ticket"]["subject"].endswith("· 4 min 44 sec")
+
+
+def test_length_appended_once_even_if_hangup_follows_recap(client):
+    # Backfill on recap, then a late hangup arrives — must not append twice.
+    post(client, _answer(master_call_id="M"))
+    post(client, _event("recap_summary", master_call_id="M",
+                        recap_summary="s", talk_time=120000))
+    n_subj = len([p for p in client.fake.puts if "subject" in p[1]["json"]["ticket"]])
+    post(client, _event("hangup", master_call_id="M", talk_time=120000))
+    n_subj2 = len([p for p in client.fake.puts if "subject" in p[1]["json"]["ticket"]])
+    assert n_subj == n_subj2                                 # no second append
+
+
 def test_duplicate_connected_does_not_double_create(client):
     post(client, _answer(call_id="L1", master_call_id="M"))
     post(client, _answer(call_id="L2", master_call_id="M"))

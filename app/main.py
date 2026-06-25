@@ -247,12 +247,20 @@ def _log_ticketing(reason: str, event: dict):
 
 
 def _append_length(key: str, ticket_id: int, event: dict):
-    """Phase 2: append the call length to the subject once, on hangup."""
+    """Append the call length to the subject once, from the first event that
+    actually carries it. Normally that's the 'hangup'; but if Dialpad drops/never
+    delivers the hangup (seen in prod on overlapping calls), the 'recap_summary'
+    and other late events also carry talk_time, so this backfills from whatever
+    arrives first. Only marks the call enriched once a real length has been
+    appended — so an early event with no talk_time (e.g. 'connected' flowing
+    through _attach_extras) can't prematurely lock it."""
     if store.is_enriched(key):
         return
-    base = store.get_subject(key)
     secs = round((event.get("talk_time") or event.get("duration") or 0) / 1000)
-    if base and secs:
+    if not secs:
+        return
+    base = store.get_subject(key)
+    if base:
         _update_ticket(ticket_id, {"subject": f"{base} · {_fmt_duration(secs * 1000)}"})
         log.info("appended length to ticket %s (call %s): %s",
                  ticket_id, key, _fmt_duration(secs * 1000))
@@ -265,6 +273,13 @@ def _attach_extras(call_id: str, event: dict):
         _maybe_attach_recap(call_id, event)
     if event.get("voicemail_link") or event.get("transcription_text"):
         _maybe_attach_voicemail(call_id, event)
+    # Backfill the call length from any later event that carries talk_time (the
+    # recap reliably does), so a missed/dropped 'hangup' doesn't leave the subject
+    # without a duration. Idempotent: _append_length no-ops once enriched.
+    if event.get("talk_time"):
+        ticket_id = store.get_ticket(call_id)
+        if ticket_id:
+            _append_length(call_id, ticket_id, event)
 
 
 def _norm_phone(p: str) -> str:

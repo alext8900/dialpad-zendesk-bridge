@@ -18,7 +18,7 @@ replacing, the native integration.
 2. Make a venv and run the tests — know the baseline before changing anything:
    ```bash
    python -m venv .venv && ./.venv/bin/pip install -r requirements-dev.txt
-   ./.venv/bin/python -m pytest -q          # expect: 37 passed
+   ./.venv/bin/python -m pytest -q          # expect: 39 passed
    ```
 3. Read the file you're about to change. The whole request-handling flow lives in
    `app/main.py:dialpad_webhook`.
@@ -100,7 +100,8 @@ else plain JSON), then:
 
 **Content**
 - ✅ Subject: `Dialpad call with {caller} — answered by {agent} · {length}`
-  (length from `talk_time`, appended at hangup). Voicemail:
+  (length from `talk_time`, appended at hangup — or **backfilled from the recap**
+  or any later event carrying `talk_time` if Dialpad drops the hangup). Voicemail:
   `Dialpad voicemail from {caller}`.
 - ✅ Call center added as a **slugged tag** (`it_technical_support`), like native.
 - ✅ `(Don't Call)` marker stripped from subject, body, and tag.
@@ -181,6 +182,11 @@ else plain JSON), then:
 - **env_file inline comments** → polluted values / 500. → comments on their own
   lines; `_cfg()` strips them defensively.
 - **Contact `external_id`** makes Zendesk contacts unmergeable. → don't set it.
+- **Dropped `hangup` event:** on overlapping calls Dialpad sometimes never delivers
+  the `hangup`, so the call length was never appended (the recap fired with the
+  final `talk_time`, but only `hangup` appended length). → `_append_length` now
+  backfills from any event carrying `talk_time` (via `_attach_extras`), idempotent
+  on `is_enriched`; `mark_enriched` only fires once a real length is appended.
 - **Agent downgraded to end-user:** a support agent calling the help desk got their
   Zendesk role flipped to end-user, because `users/create_or_update.json` matches by
   email and we sent `role: end-user`. → resolve the requester by reusing any existing
