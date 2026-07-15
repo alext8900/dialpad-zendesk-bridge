@@ -143,8 +143,21 @@ else plain JSON), then:
 
 - **Repo:** github.com/alext8900/dialpad-zendesk-bridge (public; **no secrets** in
   it — `.env` is gitignored).
-- **Server:** Windows Docker host (`C:\docker\dialpad-zendesk-bridge`). Workflow:
-  push here → `git pull` on the server → `docker compose up -d --build`.
+- **Server:** the stack runs **in WSL** on the Windows box, from
+  `/home/bpiadmin/stacks/dialpad-zendesk-bridge` (confirm with `docker compose ls`,
+  which prints the compose file path of every running project). Workflow: push here
+  → `git pull` **in that WSL directory** → `docker compose up -d --build`.
+  ⚠️ `C:\docker\dialpad-zendesk-bridge` on the Windows side is a **stale copy**.
+  Pulling there deploys NOTHING and looks exactly like a successful deploy. It cost
+  a full debugging cycle on 2026-07-15; the docs said Windows and the truth was WSL.
+- **Verify what is actually RUNNING, never infer it from git.** Docker builds from
+  the working tree (`COPY app/ ./app/`), not from git HEAD, so the tree can drift
+  from the commit and `git log` on the server proves nothing. Ask the container:
+  ```bash
+  docker compose exec bridge python -c "from app.main import CREATE_STATES; print(CREATE_STATES)"
+  ```
+  On 2026-07-15 the WSL tree sat at 11c17a4 while HEAD/`git log` looked fine, so
+  9c982e9's hangup backfill was never live despite being merged weeks earlier.
 - **Public URL:** Cloudflare Tunnel (`cloudflared` service in compose, token in
   `.env`) → `https://dialpad.bpiteam.com/dialpad/webhook`.
 - **One-time setup:** `list_dialpad_targets.py` to find IDs →
@@ -189,6 +202,20 @@ else plain JSON), then:
   final `talk_time`, but only `hangup` appended length). → `_append_length` now
   backfills from any event carrying `talk_time` (via `_attach_extras`), idempotent
   on `is_enriched`; `mark_enriched` only fires once a real length is appended.
+- **"Every file shows modified" on the server = CRLF, not a disaster.** The WSL tree
+  was copied from the Windows checkout, so every tracked file carries `\r\n` and
+  `git status` flags all ~18 of them. It reads like someone hand-edited prod. It is
+  line endings. → Diff with `git diff --ignore-cr-at-eol <commit>`; whatever survives
+  that is a REAL content difference. Do not `reset --hard` blind to make it go away:
+  look first, because a genuine server-side hotfix would hide in exactly this noise.
+  A `.gitattributes` (`* text=auto eol=lf`) would prevent the recurrence; not added
+  yet (deliberately kept out of the 2026-07-15 deploy to avoid mid-deploy churn).
+- **`git status`'s merge error lists the INCOMING commits' files, not your local
+  edits.** "Your local changes to the following files would be overwritten by merge"
+  is filtered to the files the pull would touch, so that list always matches the
+  incoming range. It is NOT evidence about what is locally modified. Reading it as
+  such sent the 2026-07-15 session down a wrong path twice. → Use `git status
+  --short` for the real local set.
 - **Phantom voicemail ticket (#753):** `state=voicemail` only means "this call ended
   up at voicemail" — Dialpad emits it even when the caller hung up during the
   greeting, and populates `voicemail_link` anyway (fetching it 404s;
