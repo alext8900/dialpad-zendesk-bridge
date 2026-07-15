@@ -62,9 +62,17 @@ ATTACH_VOICEMAIL_AUDIO = _cfg("ATTACH_VOICEMAIL_AUDIO", "true").lower() == "true
 DEBUG_PAYLOAD = _cfg("DEBUG_PAYLOAD", "false").lower() == "true"
 # States the bridge acts on. Two-phase: create on 'connected' the moment an agent
 # answers; finalize (append length) on 'hangup'. hangup also creates as a fallback
-# if the connected was missed. Voicemails create on voicemail_uploaded.
-VOICEMAIL_STATES = {"voicemail", "voicemail_uploaded"}
-CREATE_STATES = {"connected", "hangup", "voicemail", "voicemail_uploaded"}
+# if the connected was missed.
+#
+# Voicemails create ONLY on 'voicemail_uploaded'. The bare 'voicemail' state just
+# means "this call ended up at voicemail", which Dialpad also emits when the caller
+# hung up during the greeting without leaving a message: voicemail_recording_id is
+# null, was_recorded is false, and the voicemail_link it still ships 404s on fetch.
+# Only the upload event proves a recording exists. ('voicemail' was a create state
+# from the first commit, before voicemail_uploaded existed; it survived and created
+# phantom ticket 753 for a voicemail nobody left.)
+VOICEMAIL_STATES = {"voicemail_uploaded"}
+CREATE_STATES = {"connected", "hangup", "voicemail_uploaded"}
 # Only ticket INTERNAL (Dialpad-to-Dialpad) calls. External callers are already
 # ticketed by Dialpad's native Zendesk integration, so handling them here too
 # would double up. An internal caller has contact.type == "user"; external

@@ -181,6 +181,42 @@ def test_event_without_call_id_ignored(client):
     assert r.json() == {"ignored": "no call_id/state"}
 
 
+def test_voicemail_state_without_recording_creates_no_ticket(client):
+    """Caller reached the voicemail greeting and hung up WITHOUT leaving a message.
+
+    Dialpad still emits state='voicemail' (the call ended up at voicemail) and
+    still populates voicemail_link, even though no recording exists: fetching it
+    404s. Only 'voicemail_uploaded' proves a message was actually left, so the
+    bare 'voicemail' state must never create a ticket. Real payload: ticket 753.
+    """
+    r = post(client, _event("voicemail", master_call_id="M753",
+                            date_connected=None, talk_time=0, duration=0,
+                            was_recorded=False, voicemail_recording_id=None,
+                            recording_details=[], transcription_text=None,
+                            voicemail_link="https://dialpad.com/v/call-1"))
+    assert len(client.fake.posts) == 0
+    assert "created" not in r.json()
+
+
+def test_voicemail_state_then_upload_creates_exactly_one_ticket(client, monkeypatch):
+    """A real voicemail: the 'voicemail' state fires first (no ticket yet), then
+    'voicemail_uploaded' arrives with the recording and creates the one ticket.
+    Guards the fix for 753 against over-correcting into a missed real voicemail."""
+    monkeypatch.setattr(main, "DIALPAD_API_TOKEN", "dp-token")
+    monkeypatch.setattr(main, "ATTACH_VOICEMAIL_AUDIO", True)
+
+    post(client, _event("voicemail", master_call_id="M1",
+                        voicemail_link="https://dialpad.com/secureblob/voicemail/abc"))
+    assert len(client.fake.posts) == 0          # nothing yet: no message proven
+
+    r = post(client, _event("voicemail_uploaded", master_call_id="M1",
+                            voicemail_recording_id="rec-1",
+                            voicemail_link="https://dialpad.com/secureblob/voicemail/abc"))
+    assert r.json()["voicemail"] is True
+    assert len(client.fake.posts) == 1          # exactly one ticket
+    assert len(client.fake.uploads) == 1        # audio still attached
+
+
 # ---- two-phase + fallback --------------------------------------------------
 
 def test_length_appended_on_hangup(client):

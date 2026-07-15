@@ -18,7 +18,7 @@ replacing, the native integration.
 2. Make a venv and run the tests — know the baseline before changing anything:
    ```bash
    python -m venv .venv && ./.venv/bin/pip install -r requirements-dev.txt
-   ./.venv/bin/python -m pytest -q          # expect: 39 passed
+   ./.venv/bin/python -m pytest -q          # expect: 41 passed
    ```
 3. Read the file you're about to change. The whole request-handling flow lives in
    `app/main.py:dialpad_webhook`.
@@ -78,6 +78,8 @@ else plain JSON), then:
 - ✅ Voicemail (incl. after-hours department voicemail) → ticket.
 - ✅ Menu-disconnect / IVR-abandon / ring-and-hangup → **no ticket** (they never
   set the answer fields). This was real noise we deliberately filter.
+- ✅ Reached the voicemail greeting and hung up **without leaving a message** →
+  **no ticket** (only `voicemail_uploaded` proves a recording exists).
 - ✅ Outbound calls and external callers → skipped.
 
 **Assignment**
@@ -187,6 +189,16 @@ else plain JSON), then:
   final `talk_time`, but only `hangup` appended length). → `_append_length` now
   backfills from any event carrying `talk_time` (via `_attach_extras`), idempotent
   on `is_enriched`; `mark_enriched` only fires once a real length is appended.
+- **Phantom voicemail ticket (#753):** `state=voicemail` only means "this call ended
+  up at voicemail" — Dialpad emits it even when the caller hung up during the
+  greeting, and populates `voicemail_link` anyway (fetching it 404s;
+  `voicemail_recording_id`/`was_recorded`/`transcription_text` are the honest
+  signals and are null/false). `"voicemail"` had been a create state since the first
+  commit, before `voicemail_uploaded` existed; 658eb21 added the upload state and the
+  comments, but left the legacy one in `CREATE_STATES` — so the code contradicted its
+  own docs for a month. Invisible on real voicemails (the upload event just deduped),
+  so only an empty one exposed it. → **create voicemails ONLY on `voicemail_uploaded`**;
+  it is the only event that proves a message exists.
 - **Agent downgraded to end-user:** a support agent calling the help desk got their
   Zendesk role flipped to end-user, because `users/create_or_update.json` matches by
   email and we sent `role: end-user`. → resolve the requester by reusing any existing
@@ -206,6 +218,23 @@ else plain JSON), then:
   be chosen later.
 - **"close out" on hangup** appends the length only — it does **not** set the
   Zendesk ticket to Solved/Closed (intentional). Revisit if auto-status is wanted.
+- **Create path is check-then-act, and only accidentally race-free.** `dialpad_webhook`
+  reads `store.get_ticket(key)` and only later calls `store.save_ticket()`, with a
+  Zendesk POST in between — a classic TOCTOU window. It is currently **unreachable**:
+  the handler is `async def` but its only `await` is `request.body()` (main.py:121),
+  *before* the window, and every HTTP call inside is **sync httpx** on uvicorn's
+  default single worker, so the event loop cannot interleave two webhooks inside the
+  critical section. `save_ticket`'s `INSERT OR IGNORE` would then *mask* a double
+  create by silently dropping the second row, orphaning a real Zendesk ticket.
+  This safety is load-bearing accident: switching to `httpx.AsyncClient`, adding
+  `await` in the window, or running `--workers 2` opens the race immediately.
+  → If that ever changes, make creation an atomic claim-then-create (`INSERT OR
+  IGNORE ... ticket_id NULL` as the lock) on the **existing `calls` table, keyed on
+  the canonical alias key** — NOT a new table and NOT keyed on `master_call_id` (the
+  operator leg has `master_call_id: null`; single-id keying is the duplicate-ticket
+  bug 47efa02 fixed). Note `get_ticket` returns `None` for both "no row" and
+  "ticket_id IS NULL", so a claim row is invisible to the current dedup check and
+  would need handling, along with releasing the claim if the Zendesk create throws.
 - **CI** is not wired up. Tests are local/pre-push for now.
 - The deprecated FastAPI `@app.on_event("startup")` could move to a lifespan
   handler (cosmetic warning only).
