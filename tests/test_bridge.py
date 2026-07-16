@@ -125,6 +125,14 @@ def _cc_answer(call_id="LEG", master="M", op="OP1", **extra):
     return ev
 
 
+def _office_answer(call_id="ocall-1", **extra):
+    """An office-line 'connected' where the agent (target user) answered. The
+    caller is a shared BPI office line (contact.type=office), no individual."""
+    ev = _event("connected", call_id=call_id, date_connected=1, **extra)
+    ev["contact"] = {"name": "BPI Jackson", "phone": "+16019816060", "type": "office"}
+    return ev
+
+
 def post(client, event):
     return client.post("/dialpad/webhook", json=event)
 
@@ -215,6 +223,103 @@ def test_voicemail_state_then_upload_creates_exactly_one_ticket(client, monkeypa
     assert r.json()["voicemail"] is True
     assert len(client.fake.posts) == 1          # exactly one ticket
     assert len(client.fake.uploads) == 1        # audio still attached
+
+
+# ---- office-line callers (ALE-77) ------------------------------------------
+
+_SENTINEL = "Summaries are currently not generated for short calls or voicemails."
+
+
+def test_local_caller_id_call_skipped(client, monkeypatch):
+    """contact.type=local is the native-handled AT&T caller-ID case (e.g. caller
+    ID 'Building Plastics, Inc'). Even with office ticketing ON, local must never
+    ticket, or we double-ticket what native already handles. Highest priority."""
+    monkeypatch.setattr(main, "INTERNAL_CONTACT_TYPES", {"user", "office"})
+    ev = _event("connected", master_call_id="L", date_connected=1)
+    ev["contact"] = {"name": "Building Plasti", "phone": "+19018703476", "type": "local"}
+    ev["target"] = {"type": "user", "name": "Willem", "email": "w@x.com"}
+    r = post(client, ev)
+    assert "ignored" in r.json() and "external" in r.json()["ignored"]
+    assert len(client.fake.posts) == 0
+
+
+def test_gate_office_included_tickets(client, monkeypatch):
+    monkeypatch.setattr(main, "INTERNAL_CONTACT_TYPES", {"user", "office"})
+    r = post(client, _office_answer(master_call_id="G1"))
+    assert "created" in r.json()
+    assert len(client.fake.posts) == 1
+
+
+def test_gate_office_excluded_skips(client, monkeypatch):
+    # Prove the gate logic, not just the default: with office absent, office skips.
+    monkeypatch.setattr(main, "INTERNAL_CONTACT_TYPES", {"user"})
+    r = post(client, _office_answer(master_call_id="G2"))
+    assert "ignored" in r.json()
+    assert len(client.fake.posts) == 0
+
+
+def test_office_answered_creates_ticket_with_note_and_tags(client):
+    ev = _office_answer(master_call_id="OM")
+    ev["target"] = {"type": "user", "name": "Willem Bermel", "email": "wbermel@x.com"}
+    client.fake.agents = {"wbermel@x.com": 55}
+    r = post(client, ev)
+    assert "created" in r.json()
+    assert len(client.fake.posts) == 1
+    tk = client.fake.posts[0][1]["json"]["ticket"]
+    # requester is the office placeholder end-user "BPI Jackson"
+    assert client.fake.created_users
+    assert client.fake.created_users[-1]["payload"]["name"] == "BPI Jackson"
+    # office note lives in the (private) first comment
+    assert tk["comment"]["public"] is False
+    body = tk["comment"]["body"]
+    assert "Shared office line" in body and "placeholder" in body
+    # filterable tags for a "needs requester confirmation" view
+    assert "office-line" in tk["tags"] and "verify-requester" in tk["tags"]
+    # still assigned to the answering agent
+    assert 55 in _assignees(client.fake)
+
+
+def test_user_call_has_no_office_note_or_tags(client):
+    post(client, _answer(master_call_id="UM"))
+    tk = client.fake.posts[0][1]["json"]["ticket"]
+    assert "office-line" not in tk["tags"]
+    assert "verify-requester" not in tk["tags"]
+    assert "Shared office line" not in tk["comment"]["body"]
+
+
+def test_office_voicemail_has_note_and_tags(client):
+    ev = _event("voicemail_uploaded", master_call_id="OV",
+                voicemail_link="https://dialpad.com/vm/x")
+    ev["contact"] = {"name": "BPI Houston", "phone": "+17138969001", "type": "office"}
+    r = post(client, ev)
+    assert r.json()["voicemail"] is True
+    tk = client.fake.posts[0][1]["json"]["ticket"]
+    assert "office-line" in tk["tags"] and "verify-requester" in tk["tags"]
+    assert "voicemail" in tk["tags"]
+    assert "Shared office line" in tk["comment"]["body"]
+
+
+def test_recap_sentinel_suppressed_real_attached(client):
+    # Dialpad's "no summary" apology must NOT be attached as if it were a recap.
+    post(client, _answer(call_id="A1", master_call_id="S1"))
+    post(client, _event("recap_summary", call_id="A1", master_call_id="S1",
+                        recap_summary=_SENTINEL))
+    assert not any("AI call recap" in
+                   p[1]["json"]["ticket"].get("comment", {}).get("body", "")
+                   for p in client.fake.puts)
+    # same sentinel with surrounding whitespace is still suppressed
+    post(client, _event("recap_summary", call_id="A1", master_call_id="S1",
+                        recap_summary="  " + _SENTINEL + "  "))
+    assert not any("AI call recap" in
+                   p[1]["json"]["ticket"].get("comment", {}).get("body", "")
+                   for p in client.fake.puts)
+    # a REAL summary on a different call still attaches
+    post(client, _answer(call_id="A2", master_call_id="S2"))
+    post(client, _event("recap_summary", call_id="A2", master_call_id="S2",
+                        recap_summary="Reset the user's password."))
+    assert any("Reset the user's password" in
+               p[1]["json"]["ticket"].get("comment", {}).get("body", "")
+               for p in client.fake.puts)
 
 
 # ---- two-phase + fallback --------------------------------------------------

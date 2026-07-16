@@ -73,6 +73,13 @@ DEBUG_PAYLOAD = _cfg("DEBUG_PAYLOAD", "false").lower() == "true"
 # phantom ticket 753 for a voicemail nobody left.)
 VOICEMAIL_STATES = {"voicemail_uploaded"}
 CREATE_STATES = {"connected", "hangup", "voicemail_uploaded"}
+# Dialpad returns this human-readable sentinel in recap_summary when it has nothing
+# to summarize (voicemails, short calls) instead of leaving the field empty. It is
+# NOT a real recap, so never attach it as one. Exact-match only; add variants here
+# if Dialpad changes the wording.
+RECAP_SENTINELS = frozenset({
+    "Summaries are currently not generated for short calls or voicemails.",
+})
 # Only ticket INTERNAL (Dialpad-to-Dialpad) calls. External callers are already
 # ticketed by Dialpad's native Zendesk integration, so handling them here too
 # would double up. An internal caller has contact.type == "user"; external
@@ -81,7 +88,7 @@ CREATE_STATES = {"connected", "hangup", "voicemail_uploaded"}
 INTERNAL_ONLY = _cfg("INTERNAL_ONLY", "true").lower() == "true"
 INTERNAL_CONTACT_TYPES = {
     t.strip().lower()
-    for t in _cfg("INTERNAL_CONTACT_TYPES", "user").split(",")
+    for t in _cfg("INTERNAL_CONTACT_TYPES", "user,office").split(",")
     if t.strip()
 }
 
@@ -245,6 +252,14 @@ async def dialpad_webhook(request: Request):
 
 def contact_type_is_agent(target: dict) -> bool:
     return (target.get("type") or "").lower() == "user"
+
+
+def _is_office(event: dict) -> bool:
+    """The caller is a shared BPI office line (contact.type=office), not a single
+    person. These get a placeholder requester (the office) that the tech confirms
+    later from the recap/recording. (contact.type=local is an EXTERNAL caller-ID
+    match handled by the native integration, and is deliberately not office.)"""
+    return ((event.get("contact") or {}).get("type") or "").lower() == "office"
 
 
 def _log_ticketing(reason: str, event: dict):
@@ -554,6 +569,10 @@ def _render_body(event: dict, answered: bool, voicemail: bool,
              f"Direction: {(event.get('direction') or 'n/a').title()}"]
     if answered and talk_secs:
         lines.append(f"Talk time: {_fmt_duration(talk_secs * 1000)}")
+    if _is_office(event):
+        lines += ["", "NOTE: Shared office line, so the requester is a placeholder. "
+                  "Confirm the actual caller (see the call recap / recording) and "
+                  "update the requester."]
     lines += ["", "— Caller —", f"Name: {contact.get('name') or '—'}"]
     if contact.get("email"):
         lines.append(f"Email: {contact['email']}")
@@ -585,6 +604,10 @@ def _create_ticket(event: dict, answered: bool, voicemail: bool = False,
     cc_tag = _cc_tag(event)
     if cc_tag:
         tags.append(cc_tag)
+    if _is_office(event):
+        # Filterable so a Zendesk view/trigger can surface office-line tickets whose
+        # requester is a placeholder and needs a human to confirm the actual caller.
+        tags += ["office-line", "verify-requester"]
 
     ticket = {
         "subject": subject,
@@ -649,7 +672,7 @@ def _maybe_attach_recap(call_id: str, event: dict):
     if not ticket_id or store.recap_done(call_id):
         return
     summary = (event.get("recap_summary") or "").strip()
-    if not summary:
+    if not summary or summary in RECAP_SENTINELS:
         return
     lines = ["AI call recap (Dialpad):", "", summary]
     outcome = event.get("recap_outcome")
