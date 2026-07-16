@@ -268,6 +268,23 @@ else plain JSON), then:
 
 ---
 
+## Project tracking (Linear)
+
+Work on this bridge is tracked in Linear: project **Dialpad → Zendesk Bridge**
+(team ALE, native connector):
+https://linear.app/alex-thompson/project/dialpad-zendesk-bridge-66a271676483
+
+Keep the board in sync as work happens, not after. The board, not chat, is the
+source of truth for what is in flight:
+
+- Newly discovered bug or follow-up: file it as a Linear issue immediately, do not
+  leave it sitting in chat.
+- Starting work on an issue: set it In Progress.
+- Code lands on the deploy path (pushed to `main`, pulled on the server): set it In
+  Review.
+- Verified working in production (QA passes): set it Done.
+- Design specs live in `docs/superpowers/specs/`; link the spec from its issue.
+
 ## Operating rules
 
 The full operating rules (Rules 1–12, CI/CD & Testing rules T1–T10, autonomous
