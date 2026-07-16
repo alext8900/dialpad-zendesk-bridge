@@ -92,13 +92,29 @@ ticket's first comment, e.g.:
   or voicemails" placeholder instead of a real recap.
 - Wording avoids em dashes, per project style.
 
-### 4. Everything else: unchanged
+### 4. Suppress Dialpad's "no recap" sentinel (folded in)
+
+Dialpad returns a human-readable sentinel in `recap_summary` when it has nothing
+to summarize (voicemails and short calls): `"Summaries are currently not generated
+for short calls or voicemails."` `_maybe_attach_recap` only checks the field is
+non-empty, so it posts that apology string as if it were the AI's recap, cluttering
+exactly the low-context tickets (voicemails, short calls) this feature also creates.
+
+Fix: after stripping `recap_summary`, bail if it matches a known sentinel. Use
+**exact match against a small list** of known sentinel strings, not a substring
+check. A false negative (a new sentinel variant slips through once) is harmless
+noise; a false positive (suppressing a real recap because it happened to contain
+similar words) loses real content. Add variants to the list if Dialpad changes the
+wording.
+
+### 5. Everything else: unchanged
 
 Office calls ride the existing call-center to operator path (the same path the
 Courtney call took: `target.type == call_center`, agent on the operator leg).
-So create-on-`connected`, last-answerer assignment, alias-map dedup, recap
-attach, recording attach, hangup length-append, and voicemail
-(`voicemail_uploaded`, per the 2026-07-16 fix) all apply with no change.
+So create-on-`connected`, last-answerer assignment, alias-map dedup, recording
+attach, hangup length-append, and voicemail (`voicemail_uploaded`, per the
+2026-07-16 fix) all apply with no change. Recap attach applies too, with the one
+change in section 4 (sentinel suppression).
 
 ## Non-goals
 
@@ -107,9 +123,6 @@ attach, recording attach, hangup length-append, and voicemail
   agent, the caller, and a discussed third party). A human corrects the
   requester instead.
 - **No new contact types beyond `office`.**
-- **The placeholder-recap bug** (attaching "Summaries are currently not
-  generated..." as if it were a real recap) is real and will affect these
-  tickets too, but it is a separate pre-existing issue and is not fixed here.
 
 ## Risks
 
@@ -124,6 +137,7 @@ attach, recording attach, hangup length-append, and voicemail
   the widened set.
 - First-comment/body rendering (`_render_body` / `_create_ticket`) for the
   office note, conditional on `contact.type == "office"`.
+- `_maybe_attach_recap` (`app/main.py` ~L651) for the sentinel suppression.
 
 ## Tests
 
@@ -133,3 +147,6 @@ attach, recording attach, hangup length-append, and voicemail
    placeholder, assigned to the answering tech, and carries the internal note.
 3. **`office` voicemail** creates a voicemail ticket (confirms composition with
    the 2026-07-16 `voicemail_uploaded` fix).
+4. **Sentinel recap suppression:** a `recap_summary` equal to Dialpad's
+   "Summaries are currently not generated..." sentinel attaches **no** recap
+   comment; a real summary still attaches as before.
